@@ -102,12 +102,15 @@ pub struct OutboxConfig {
     pub poll_interval_ms: u64,
     pub batch_size: i64,
     pub lock_ttl_secs: i64,
+    /// Backoff cap for jobs towards gum-indexer / gum-engine. These never give up.
+    pub upstream_retry_cap_ms: u64,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ReconcilerConfig {
     pub interval_secs: u64,
     pub paid_stale_secs: i64,
+    pub open_stale_secs: i64,
     pub idempotency_ttl_secs: i64,
 }
 

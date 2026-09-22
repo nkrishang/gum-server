@@ -76,11 +76,17 @@ workers = 8
 poll_interval_ms = 500
 batch_size = 32
 lock_ttl_secs = 60
+# Jobs towards gum-indexer / gum-engine are on the settlement's critical path: short backoff cap,
+# retried until the deposit is terminal. App webhooks use [webhooks] retry_cap_ms / max_age_secs.
+upstream_retry_cap_ms = 30000
 
 [reconciler]
 interval_secs = 60
 # A deposit in `paid` with no engine webhook for this long is polled directly.
 paid_stale_secs = 600
+# An open deposit (pending / partial_paid) that has not changed for this long is checked against
+# the indexer's watch, in case a payment.* / threshold.reached delivery was lost.
+open_stale_secs = 900
 idempotency_ttl_secs = 86400
 
 [admin]

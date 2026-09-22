@@ -17,6 +17,7 @@ use crate::chain::payment::PaymentTerms;
 use crate::clients::UpstreamError;
 use crate::clients::engine::{SubmitTransaction, Webhook};
 use crate::clients::indexer::CreateWatch;
+use crate::config::Config;
 use crate::deposit::{DepositStatus, events, store};
 use crate::state::AppState;
 use crate::webhooks::sign;
@@ -155,21 +156,23 @@ async fn execute(state: AppState, job: OutboxJob) {
         }
         Attempt::Retry(error) => {
             let age = (Utc::now() - job.created_at).num_seconds();
-            if age > state.config.webhooks.max_age_secs {
-                tracing::error!(error, age_secs = age, "outbox job exhausted its retry window");
-                mark_dead(&state, job.id, &error).await
-            } else {
-                let delay = backoff(&state, job.attempts);
-                tracing::warn!(error, retry_in_ms = delay.as_millis() as u64, "outbox job failed; will retry");
-                sqlx::query(
-                    "UPDATE outbox SET next_attempt_at = now() + make_interval(secs => $2), locked_until = NULL, last_error = $3 WHERE id = $1",
-                )
-                .bind(job.id)
-                .bind(delay.as_secs_f64())
-                .bind(error)
-                .execute(&state.pool)
-                .await
-                .map(|_| ())
+            match schedule(&state.config, &job.kind, job.attempts, age, rand::random::<f64>()) {
+                Schedule::Dead => {
+                    tracing::error!(error, age_secs = age, "outbox job exhausted its retry window");
+                    mark_dead(&state, job.id, &error).await
+                }
+                Schedule::Retry(delay) => {
+                    tracing::warn!(error, retry_in_ms = delay.as_millis() as u64, "outbox job failed; will retry");
+                    sqlx::query(
+                        "UPDATE outbox SET next_attempt_at = now() + make_interval(secs => $2), locked_until = NULL, last_error = $3 WHERE id = $1",
+                    )
+                    .bind(job.id)
+                    .bind(delay.as_secs_f64())
+                    .bind(error)
+                    .execute(&state.pool)
+                    .await
+                    .map(|_| ())
+                }
             }
         }
         Attempt::Dead(error) => {
@@ -192,13 +195,29 @@ async fn mark_dead(state: &AppState, id: Uuid, error: &str) -> Result<(), sqlx::
         .map(|_| ())
 }
 
-/// Exponential backoff with full jitter, capped.
-fn backoff(state: &AppState, attempts: i32) -> Duration {
-    let base = state.config.webhooks.retry_base_ms as f64;
-    let cap = state.config.webhooks.retry_cap_ms as f64;
+#[derive(Debug, PartialEq)]
+enum Schedule {
+    Retry(Duration),
+    Dead,
+}
+
+/// Retry policy per job kind. Jobs towards gum-indexer / gum-engine are on the settlement's
+/// critical path (a late `execute` pays recovery instead of the receiver), so they back off to a
+/// short cap and never die: they end when the deposit reaches a terminal state or its expiry.
+/// App notifications back off up to an hour and are given up on after `webhooks.max_age_secs`.
+fn schedule(config: &Config, kind: &str, attempts: i32, age_secs: i64, jitter: f64) -> Schedule {
+    let (cap_ms, max_age) = if kind == "notify_app" {
+        (config.webhooks.retry_cap_ms, Some(config.webhooks.max_age_secs))
+    } else {
+        (config.outbox.upstream_retry_cap_ms, None)
+    };
+    if max_age.is_some_and(|max| age_secs > max) {
+        return Schedule::Dead;
+    }
+    let base = config.webhooks.retry_base_ms as f64;
     let exp = base * 2f64.powi(attempts.saturating_sub(1).min(30));
-    let upper = exp.min(cap);
-    Duration::from_millis((base + rand::random::<f64>() * (upper - base).max(0.0)) as u64)
+    let upper = exp.min(cap_ms as f64);
+    Schedule::Retry(Duration::from_millis((base + jitter * (upper - base).max(0.0)) as u64))
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -408,5 +427,44 @@ async fn notify_app(state: &AppState, job: &OutboxJob) -> Attempt {
             metrics::histogram!("gum_upstream_request_duration_seconds", "service" => "app", "op" => "notify", "outcome" => "transport").record(elapsed);
             Attempt::Retry(format!("app webhook unreachable: {e}"))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    fn config() -> Config {
+        let mut c = Config::load_unchecked(Path::new("config")).unwrap();
+        c.webhooks.retry_base_ms = 1000;
+        c.webhooks.retry_cap_ms = 3_600_000;
+        c.webhooks.max_age_secs = 86_400;
+        c.outbox.upstream_retry_cap_ms = 30_000;
+        c
+    }
+
+    #[test]
+    fn upstream_jobs_back_off_to_a_short_cap_and_never_die() {
+        let c = config();
+        assert_eq!(schedule(&c, "submit_execute", 1, 0, 1.0), Schedule::Retry(Duration::from_millis(1000)));
+        assert_eq!(schedule(&c, "submit_execute", 3, 0, 1.0), Schedule::Retry(Duration::from_millis(4000)));
+        assert_eq!(schedule(&c, "submit_execute", 20, 0, 1.0), Schedule::Retry(Duration::from_millis(30_000)));
+        assert_eq!(
+            schedule(&c, "register_watch", 50, 10 * 86_400, 1.0),
+            Schedule::Retry(Duration::from_millis(30_000))
+        );
+    }
+
+    #[test]
+    fn app_webhooks_back_off_to_an_hour_and_die_after_a_day() {
+        let c = config();
+        assert_eq!(schedule(&c, "notify_app", 20, 0, 1.0), Schedule::Retry(Duration::from_millis(3_600_000)));
+        assert_eq!(
+            schedule(&c, "notify_app", 2, 0, 0.0),
+            Schedule::Retry(Duration::from_millis(1000)),
+            "full jitter floor"
+        );
+        assert_eq!(schedule(&c, "notify_app", 20, 86_401, 1.0), Schedule::Dead);
     }
 }

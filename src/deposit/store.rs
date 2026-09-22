@@ -589,6 +589,43 @@ pub async fn stale_paid(pool: &PgPool, stale_secs: i64, limit: i64) -> Result<Ve
     .await
 }
 
+/// Open deposits with a registered watch that have not changed for `stale_secs`; the reconciler
+/// compares them with the indexer's view of the watch.
+pub async fn stale_open(pool: &PgPool, stale_secs: i64, limit: i64) -> Result<Vec<Deposit>, sqlx::Error> {
+    sqlx::query_as(select_deposit(
+        "status IN ('pending', 'partial_paid') AND watch_id IS NOT NULL AND updated_at < now() - make_interval(secs => $1) \
+         ORDER BY updated_at LIMIT $2",
+    ))
+    .bind(stale_secs as f64)
+    .bind(limit)
+    .fetch_all(pool)
+    .await
+}
+
+/// Bumps `updated_at` so the reconciler does not re-check the row every tick.
+pub async fn touch(pool: &PgPool, id: Uuid) -> Result<(), sqlx::Error> {
+    sqlx::query("UPDATE deposits SET updated_at = now() WHERE id = $1").bind(id).execute(pool).await?;
+    Ok(())
+}
+
+/// Forgets a watch the indexer does not know (any more) and queues a fresh registration.
+pub async fn reregister_watch(pool: &PgPool, id: Uuid) -> Result<bool, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    let deposit: Option<Deposit> = sqlx::query_as(update_deposit(
+        "watch_id = NULL, watch_registered_at = NULL",
+        "id = $1 AND status IN ('pending', 'partial_paid')",
+    ))
+    .bind(id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    if let Some(d) = &deposit {
+        record_event(&mut tx, d, events::WATCH_LOST, json!({})).await?;
+        enqueue(&mut tx, "register_watch", d.id, json!({})).await?;
+    }
+    tx.commit().await?;
+    Ok(deposit.is_some())
+}
+
 pub async fn prune(pool: &PgPool, idempotency_ttl_secs: i64) -> Result<(), sqlx::Error> {
     sqlx::query("DELETE FROM idempotency_keys WHERE created_at < now() - make_interval(secs => $1)")
         .bind(idempotency_ttl_secs as f64)

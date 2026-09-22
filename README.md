@@ -155,6 +155,11 @@ POST /v1/admin/outbox/{id}/requeue
   memory, and commits one transaction (deposit + idempotency key + outbox row). Registering the watch,
   submitting the settlement and notifying the app are outbox jobs executed by background workers with
   exponential backoff, so an upstream outage never fails or slows the API.
+- **Retry policy per job.** Jobs towards gum-indexer / gum-engine are on the settlement's critical path
+  (an `execute` after `expires_at` pays recovery, not the receiver): they back off to
+  `outbox.upstream_retry_cap_ms` (30 s) and never give up — they end when the deposit is terminal or
+  expired. App webhooks back off to an hour and are marked dead after `webhooks.max_age_secs` (24 h);
+  dead ones are listed on `/v1/admin/outbox` and can be requeued.
 - **Webhooks are acknowledged as soon as their state change commits.** Each inbound event is verified,
   deduplicated on its id *inside the same transaction* as the transition it causes, and answered `200`.
   Nothing slow happens on the sender's clock. Database trouble returns `503` so the sender retries.
@@ -167,8 +172,13 @@ POST /v1/admin/outbox/{id}/requeue
   `Settled(receiver, amount)` from the payment address. A `Recovered`-only receipt (executed after
   expiry) is `failed / expired_on_chain`. Engine failures that never executed (`expired`,
   `stuck_cancelled`, `internal`) are resubmitted up to three times before the app is told.
-- **A reconciler backstops lost webhooks.** Every `reconciler.interval_secs` it polls the engine for
-  deposits stuck in `paid`, expires overdue deposits locally, and prunes idempotency keys.
+- **A reconciler makes webhooks an optimisation, not a dependency.** Every `reconciler.interval_secs`
+  it compares quiet open deposits with the indexer's watch (`GET /v1/watches/{id}`: applies a lost
+  `payment.confirmed` / `threshold.reached` / `watch.expired`, re-registers a watch the indexer no longer
+  knows) and quiet `paid` deposits with the engine's job (`GET /v1/transactions/{id}`: applies a lost
+  `transaction.confirmed` / `.failed`, resubmits a job the engine no longer knows). It applies exactly
+  the guarded transitions a webhook would, so it is safe on every replica. Local expiry without the
+  indexer's say-so only happens a full day after `expires_at`.
 - **Backpressure and limits.** Per-key token buckets, a body limit, a request timeout, a concurrency
   cap with load shedding (`503 shedding`), panic isolation, graceful drain on SIGTERM.
 - **Multiple replicas are safe.** Outbox claims use `FOR UPDATE SKIP LOCKED`; every write is idempotent.

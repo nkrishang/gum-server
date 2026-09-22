@@ -381,7 +381,7 @@ pub async fn apply_settlement(
 }
 
 /// Detaches a still-`paid` deposit from its engine job and queues a fresh `execute`.
-async fn resubmit(conn: &mut sqlx::PgConnection, deposit: &Deposit, data: Value) -> Result<bool, sqlx::Error> {
+pub async fn resubmit(conn: &mut sqlx::PgConnection, deposit: &Deposit, data: Value) -> Result<bool, sqlx::Error> {
     let detached: Option<Deposit> = sqlx::query_as(store::update_deposit(
         "engine_job_id = NULL, engine_submitted_at = NULL",
         "id = $1 AND status = 'paid'",

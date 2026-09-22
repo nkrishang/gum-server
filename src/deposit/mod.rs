@@ -229,6 +229,10 @@ impl From<DepositEvent> for DepositEventView {
 pub mod events {
     pub const CREATED: &str = "deposit.created";
     pub const WATCH_REGISTERED: &str = "deposit.watch_registered";
+    /// The indexer no longer knew our watch; a new one was registered.
+    pub const WATCH_LOST: &str = "deposit.watch_lost";
+    /// A state change recovered by polling instead of a webhook.
+    pub const RECONCILED: &str = "deposit.reconciled";
     /// app: a transfer to the payment address was seen at chain head.
     pub const DETECTED: &str = "deposit.detected";
     /// app: a transfer was confirmed; `confirmed_amount` is the new total.

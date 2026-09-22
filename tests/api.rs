@@ -701,3 +701,209 @@ async fn health_and_reference_routes() {
     assert_eq!(res.status(), 404);
     assert_eq!(res.json::<Value>().await.unwrap()["error"]["code"], "not_found");
 }
+
+async fn age(pool: &sqlx::PgPool, id: Uuid, secs: i64) {
+    sqlx::query("UPDATE deposits SET updated_at = now() - make_interval(secs => $2) WHERE id = $1")
+        .bind(id)
+        .bind(secs as f64)
+        .execute(pool)
+        .await
+        .unwrap();
+}
+
+/// Webhooks are the fast path; the reconciler must reach the same outcome without them.
+#[tokio::test]
+async fn reconciler_recovers_lost_webhooks() {
+    let h = harness!();
+    mount_upstreams(&h).await;
+    let key = h.api_key_for("did:privy:erin").await;
+    let created: Value = h
+        .http
+        .post(h.url("/v1/deposit"))
+        .bearer_auth(&key)
+        .json(&deposit_body())
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let id: Uuid = created["id"].as_str().unwrap().parse().unwrap();
+    let payment_address = created["payment_address"].as_str().unwrap().to_owned();
+    h.wait_for("watch", Duration::from_secs(5), || async {
+        sqlx::query_as::<_, (Option<Uuid>,)>("SELECT watch_id FROM deposits WHERE id = $1")
+            .bind(id)
+            .fetch_one(&h.pool)
+            .await
+            .unwrap()
+            .0
+    })
+    .await;
+
+    // 1. A fresh deposit is left alone; a quiet one is compared with the indexer's watch.
+    let watch_json = |status: &str, confirmed: &str| {
+        json!({ "id": WATCH_ID, "chain": "anvil", "chain_id": 31337, "token": "USDC", "token_address": USDC,
+                "payment_address": payment_address, "balance_threshold": "2500000", "confirmed_amount": confirmed,
+                "status": status, "webhook_endpoint": "x", "start_block": 1, "created_at": Utc::now(),
+                "expires_at": null, "completed_at": null, "transfers": [] })
+    };
+    Mock::given(method("GET"))
+        .and(path(format!("/v1/watches/{WATCH_ID}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(watch_json("active", "1000000")))
+        .up_to_n_times(1)
+        .mount(&h.indexer)
+        .await;
+    gum_server::reconciler::tick(&h.state).await.unwrap();
+    assert_eq!(h.deposit_status(id).await, "pending", "not stale yet");
+    age(&h.pool, id, 3600).await;
+    gum_server::reconciler::tick(&h.state).await.unwrap();
+    assert_eq!(h.deposit_status(id).await, "partial_paid");
+    let view: Value = h
+        .http
+        .get(h.url(&format!("/v1/deposit/id/{id}")))
+        .bearer_auth(&key)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(view["confirmed_amount"], "1000000");
+
+    // 2. The indexer completed the watch but threshold.reached never arrived.
+    Mock::given(method("GET"))
+        .and(path(format!("/v1/watches/{WATCH_ID}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(watch_json("completed", "2500000")))
+        .mount(&h.indexer)
+        .await;
+    age(&h.pool, id, 3600).await;
+    gum_server::reconciler::tick(&h.state).await.unwrap();
+    assert_eq!(h.deposit_status(id).await, "paid");
+    h.wait_for("engine submission", Duration::from_secs(5), || async {
+        sqlx::query_as::<_, (Option<Uuid>,)>("SELECT engine_job_id FROM deposits WHERE id = $1")
+            .bind(id)
+            .fetch_one(&h.pool)
+            .await
+            .unwrap()
+            .0
+    })
+    .await;
+
+    // 3. The engine lost our job (404): it is resubmitted under a new idempotency key.
+    Mock::given(method("GET"))
+        .and(path(format!("/v1/transactions/{JOB_ID}")))
+        .respond_with(
+            ResponseTemplate::new(404).set_body_json(json!({ "error": { "code": "not_found", "message": "" } })),
+        )
+        .up_to_n_times(1)
+        .mount(&h.engine)
+        .await;
+    age(&h.pool, id, 3600).await;
+    gum_server::reconciler::tick(&h.state).await.unwrap();
+    h.wait_for("resubmission", Duration::from_secs(5), || async {
+        (h.engine.received_requests().await.unwrap().iter().filter(|r| r.method == "POST").count() == 2).then_some(())
+    })
+    .await;
+    let posts: Vec<String> = h
+        .engine
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .filter(|r| r.method == "POST")
+        .map(|r| r.headers.get("idempotency-key").unwrap().to_str().unwrap().to_owned())
+        .collect();
+    assert_ne!(posts[0], posts[1]);
+    assert_eq!(h.deposit_status(id).await, "paid");
+
+    // 4. The engine confirmed the job but transaction.confirmed never arrived.
+    Mock::given(method("GET"))
+        .and(path(format!("/v1/transactions/{JOB_ID}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "job_id": JOB_ID, "chain_id": 31337, "status": "confirmed", "outcome": "success",
+            "tx_hash": "0xe15d10f3812c0d9a6c0d30cf5e84868309e0cc28b0fd7272f03df90ca4de222c", "block_number": 5,
+            "receipt": settled_receipt(&payment_address), "error": null
+        })))
+        .mount(&h.engine)
+        .await;
+    h.wait_for("job recorded", Duration::from_secs(5), || async {
+        sqlx::query_as::<_, (Option<Uuid>,)>("SELECT engine_job_id FROM deposits WHERE id = $1")
+            .bind(id)
+            .fetch_one(&h.pool)
+            .await
+            .unwrap()
+            .0
+    })
+    .await;
+    age(&h.pool, id, 3600).await;
+    gum_server::reconciler::tick(&h.state).await.unwrap();
+    assert_eq!(h.deposit_status(id).await, "settled");
+    let view: Value = h
+        .http
+        .get(h.url(&format!("/v1/deposit/id/{id}")))
+        .bearer_auth(&key)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let timeline: Vec<&str> = view["events"].as_array().unwrap().iter().map(|e| e["type"].as_str().unwrap()).collect();
+    assert!(timeline.contains(&"deposit.settlement_retried"));
+    assert_eq!(timeline.last().copied(), Some("deposit.settled"));
+    assert_eq!(view["events"].as_array().unwrap().last().unwrap()["data"]["source"], "reconciler");
+
+    // 5. A watch the indexer no longer knows is re-registered.
+    let created: Value = h
+        .http
+        .post(h.url("/v1/deposit"))
+        .bearer_auth(&key)
+        .json(&deposit_body())
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let id2: Uuid = created["id"].as_str().unwrap().parse().unwrap();
+    h.wait_for("watch 2", Duration::from_secs(5), || async {
+        sqlx::query_as::<_, (Option<Uuid>,)>("SELECT watch_id FROM deposits WHERE id = $1")
+            .bind(id2)
+            .fetch_one(&h.pool)
+            .await
+            .unwrap()
+            .0
+    })
+    .await;
+    // Point this deposit at a watch id the mock does not serve.
+    let lost = Uuid::now_v7();
+    sqlx::query("UPDATE deposits SET watch_id = $2, updated_at = now() - interval '1 hour' WHERE id = $1")
+        .bind(id2)
+        .bind(lost)
+        .execute(&h.pool)
+        .await
+        .unwrap();
+    Mock::given(method("GET"))
+        .and(path(format!("/v1/watches/{lost}")))
+        .respond_with(
+            ResponseTemplate::new(404).set_body_json(json!({ "error": { "code": "not_found", "message": "" } })),
+        )
+        .mount(&h.indexer)
+        .await;
+    let watches_before = h.indexer.received_requests().await.unwrap().iter().filter(|r| r.method == "POST").count();
+    gum_server::reconciler::tick(&h.state).await.unwrap();
+    let watch_id = h
+        .wait_for("re-registration", Duration::from_secs(5), || async {
+            sqlx::query_as::<_, (Option<Uuid>,)>("SELECT watch_id FROM deposits WHERE id = $1")
+                .bind(id2)
+                .fetch_one(&h.pool)
+                .await
+                .unwrap()
+                .0
+                .filter(|w| *w != lost)
+        })
+        .await;
+    assert_eq!(watch_id.to_string(), WATCH_ID);
+    let posts = h.indexer.received_requests().await.unwrap().iter().filter(|r| r.method == "POST").count();
+    assert_eq!(posts, watches_before + 1);
+}
