@@ -203,7 +203,7 @@ Prometheus metrics: `gum_http_request_duration_seconds{route,method,status}`,
 | `GUM_SERVER__CALLBACK_BASE_URL` | Where gum-indexer / gum-engine call back: `<base>/v1/webhooks/{indexer,engine}`. Private network in production: `http://gum-server.railway.internal:8080` |
 | `GUM_PRIVY__APP_ID`, `GUM_PRIVY__VERIFICATION_KEY` | From the Privy dashboard (PEM; `\n` escapes accepted) |
 | `GUM_PAYMENTS__FACTORY_ADDRESS`, `GUM_PAYMENTS__RECOVERY_ADDRESS` | The `PaymentFactory` generation and our recovery wallet |
-| `GUM_INDEXER__BASE_URL`, `GUM_INDEXER__API_KEY`, `GUM_INDEXER__WEBHOOK_SECRET` | gum-indexer's private URL, one of its `GUM_API__KEYS`, its `GUM_WEBHOOK__SECRET` |
+| `GUM_INDEXER__BASE_URL`, `GUM_INDEXER__WEBHOOK_SECRET` | gum-indexer's private URL (no auth), its `GUM_WEBHOOK__SECRET` |
 | `GUM_ENGINE__BASE_URL`, `GUM_ENGINE__WEBHOOK_SECRET` | gum-engine's private URL (no auth), its `webhook.signing_secret` |
 | `GUM_ADMIN__TOKEN` | Enables `/v1/admin` |
 | `PORT`, `RUST_LOG` | |

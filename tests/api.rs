@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use alloy_primitives::{Address, B256, U256};
 use chrono::Utc;
-use common::{ADMIN_TOKEN, ENGINE_SECRET, FACTORY, Harness, INDEXER_KEY, INDEXER_SECRET, USDC, deposit_body};
+use common::{ADMIN_TOKEN, ENGINE_SECRET, FACTORY, Harness, INDEXER_SECRET, USDC, deposit_body};
 use gum_server::chain::payment::PaymentTerms;
 use gum_server::webhooks::sign;
 use serde_json::{Value, json};
@@ -150,7 +150,7 @@ async fn full_deposit_lifecycle() {
         .await;
     assert_eq!(watch_id.to_string(), WATCH_ID);
     let watch_req = &h.indexer.received_requests().await.unwrap()[0];
-    assert_eq!(watch_req.headers.get("authorization").unwrap().to_str().unwrap(), format!("Bearer {INDEXER_KEY}"));
+    assert!(watch_req.headers.get("authorization").is_none(), "the indexer is reached over the private network");
     let watch_body: Value = serde_json::from_slice(&watch_req.body).unwrap();
     assert_eq!(watch_body["payment_address"], payment_address);
     assert_eq!(watch_body["balance_threshold"], "2500000");

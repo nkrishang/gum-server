@@ -24,7 +24,6 @@ use wiremock::MockServer;
 pub const PRIVY_APP_ID: &str = "test-app";
 pub const INDEXER_SECRET: &str = "indexer-secret";
 pub const ENGINE_SECRET: &str = "engine-secret";
-pub const INDEXER_KEY: &str = "indexer-api-key";
 pub const ADMIN_TOKEN: &str = "admin-token";
 pub const FACTORY: &str = "0x5FbDB2315678afecb367f032d93F642f64180aa3";
 pub const RECOVERY: &str = "0x3C44CdDdB6a900fa2b585dd299e03d12FA4293BC";
@@ -97,7 +96,6 @@ impl Harness {
         config.payments.recovery_address = RECOVERY.into();
         config.payments.min_expiry_lead_secs = 60;
         config.indexer.base_url = indexer.uri();
-        config.indexer.api_key = INDEXER_KEY.into();
         config.indexer.webhook_secret = INDEXER_SECRET.into();
         config.engine.base_url = engine.uri();
         config.engine.webhook_secret = ENGINE_SECRET.into();

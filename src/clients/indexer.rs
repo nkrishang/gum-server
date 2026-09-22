@@ -1,5 +1,5 @@
 //! gum-indexer `/v1/watches`: one watch per payment address, retired once the confirmed total
-//! reaches the deposit amount.
+//! reaches the deposit amount. Reached over the Railway private network; no authentication.
 
 use std::time::{Duration, Instant};
 
@@ -16,7 +16,6 @@ const SERVICE: &str = "indexer";
 pub struct IndexerClient {
     http: reqwest::Client,
     base_url: Option<String>,
-    api_key: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -62,11 +61,11 @@ impl IndexerClient {
             .connect_timeout(Duration::from_millis(cfg.timeout_ms.min(3000)))
             .user_agent("gum-server/1")
             .build()?;
-        Ok(Self { http, base_url: base_url(&cfg.base_url), api_key: cfg.api_key.clone() })
+        Ok(Self { http, base_url: base_url(&cfg.base_url) })
     }
 
     pub fn is_configured(&self) -> bool {
-        self.base_url.is_some() && !self.api_key.is_empty()
+        self.base_url.is_some()
     }
 
     fn url(&self, path: &str) -> Result<String, UpstreamError> {
@@ -79,7 +78,7 @@ impl IndexerClient {
     pub async fn create_watch(&self, req: &CreateWatch<'_>) -> Result<Watch, UpstreamError> {
         let url = self.url("/v1/watches")?;
         let started = Instant::now();
-        let response = self.http.post(url).bearer_auth(&self.api_key).json(req).send().await.map_err(|source| {
+        let response = self.http.post(url).json(req).send().await.map_err(|source| {
             record(SERVICE, "create_watch", started, "transport");
             UpstreamError::Transport { service: SERVICE, source }
         })?;
@@ -99,7 +98,7 @@ impl IndexerClient {
     pub async fn get_watch(&self, id: Uuid) -> Result<Option<WatchDetail>, UpstreamError> {
         let url = self.url(&format!("/v1/watches/{id}"))?;
         let started = Instant::now();
-        let response = self.http.get(url).bearer_auth(&self.api_key).send().await.map_err(|source| {
+        let response = self.http.get(url).send().await.map_err(|source| {
             record(SERVICE, "get_watch", started, "transport");
             UpstreamError::Transport { service: SERVICE, source }
         })?;

@@ -73,7 +73,6 @@ pub struct PaymentsConfig {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct IndexerConfig {
     pub base_url: String,
-    pub api_key: String,
     pub webhook_secret: String,
     pub timeout_ms: u64,
 }
@@ -206,8 +205,8 @@ impl Config {
                     .into(),
             );
         }
-        if self.indexer.base_url.is_empty() || self.indexer.api_key.is_empty() {
-            out.push("indexer.base_url / indexer.api_key are empty: watches cannot be registered".into());
+        if self.indexer.base_url.is_empty() {
+            out.push("indexer.base_url is empty: watches cannot be registered".into());
         }
         if self.engine.base_url.is_empty() {
             out.push("engine.base_url is empty: settlements cannot be submitted".into());

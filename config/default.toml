@@ -3,7 +3,7 @@
 # Secrets and endpoint URLs come from the environment as GUM_<SECTION>__<KEY>, e.g.
 #   GUM_SERVER__PUBLIC_BASE_URL, GUM_PRIVY__APP_ID, GUM_PRIVY__VERIFICATION_KEY,
 #   GUM_PAYMENTS__FACTORY_ADDRESS, GUM_PAYMENTS__RECOVERY_ADDRESS,
-#   GUM_INDEXER__BASE_URL, GUM_INDEXER__API_KEY, GUM_INDEXER__WEBHOOK_SECRET,
+#   GUM_INDEXER__BASE_URL, GUM_INDEXER__WEBHOOK_SECRET,
 #   GUM_ENGINE__BASE_URL, GUM_ENGINE__WEBHOOK_SECRET.
 # DATABASE_URL and PORT are read as-is (Railway provides both).
 
@@ -51,7 +51,6 @@ max_expiry_secs = 2592000
 
 [indexer]
 base_url = ""
-api_key = ""
 # gum-indexer's GUM_WEBHOOK__SECRET; used to verify inbound signatures.
 webhook_secret = ""
 timeout_ms = 5000
