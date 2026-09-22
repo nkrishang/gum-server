@@ -20,6 +20,9 @@ max_body_bytes = 65536
 # Requests in flight before the server sheds load with 503.
 max_in_flight = 4096
 shutdown_grace_secs = 25
+# Browser origins allowed to call the API, e.g. ["https://app.gum.money"]. Empty = no CORS headers.
+#   GUM_SERVER__CORS_ORIGINS='["https://app.gum.money"]'
+cors_origins = []
 
 [database]
 max_connections = 16

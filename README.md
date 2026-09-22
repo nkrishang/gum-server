@@ -206,6 +206,7 @@ Prometheus metrics: `gum_http_request_duration_seconds{route,method,status}`,
 | `GUM_INDEXER__BASE_URL`, `GUM_INDEXER__WEBHOOK_SECRET` | gum-indexer's private URL (no auth), its `GUM_WEBHOOK__SECRET` |
 | `GUM_ENGINE__BASE_URL`, `GUM_ENGINE__WEBHOOK_SECRET` | gum-engine's private URL (no auth), its `webhook.signing_secret` |
 | `GUM_ADMIN__TOKEN` | Enables `/v1/admin` |
+| `GUM_SERVER__CORS_ORIGINS` | JSON array of browser origins allowed to call the API (the web UI), e.g. `["https://app.gum.money"]` |
 | `PORT`, `RUST_LOG` | |
 
 The chain/token registry in `config/default.toml` must mirror gum-indexer's; adding a chain or token

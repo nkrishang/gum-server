@@ -106,6 +106,7 @@ impl Harness {
         config.outbox.workers = 4;
         config.reconciler.interval_secs = 3600;
         config.admin.token = ADMIN_TOKEN.into();
+        config.server.cors_origins = vec!["https://app.example".into()];
         config.chains = BTreeMap::from([(
             "anvil".to_owned(),
             ChainConfig {

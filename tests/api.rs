@@ -697,6 +697,21 @@ async fn health_and_reference_routes() {
     let chains: Value = h.http.get(h.url("/v1/chains")).send().await.unwrap().json().await.unwrap();
     assert_eq!(chains["chains"][0]["chain_id"], 31337);
     assert_eq!(chains["chains"][0]["tokens"][0]["symbol"], "USDC");
+    // A browser UI on the allowed origin passes preflight; any other origin gets no CORS headers.
+    let pre = h
+        .http
+        .request(reqwest::Method::OPTIONS, h.url("/v1/deposit"))
+        .header("origin", "https://app.example")
+        .header("access-control-request-method", "POST")
+        .header("access-control-request-headers", "authorization,content-type,idempotency-key")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(pre.status(), 200);
+    assert_eq!(pre.headers().get("access-control-allow-origin").unwrap(), "https://app.example");
+    assert!(pre.headers().get("access-control-allow-headers").unwrap().to_str().unwrap().contains("idempotency-key"));
+    let other = h.http.get(h.url("/healthz")).header("origin", "https://evil.example").send().await.unwrap();
+    assert!(other.headers().get("access-control-allow-origin").is_none());
     let res = h.http.get(h.url("/nope")).send().await.unwrap();
     assert_eq!(res.status(), 404);
     assert_eq!(res.json::<Value>().await.unwrap()["error"]["code"], "not_found");

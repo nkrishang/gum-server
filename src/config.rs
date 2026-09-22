@@ -36,6 +36,9 @@ pub struct ServerConfig {
     pub max_body_bytes: usize,
     pub max_in_flight: usize,
     pub shutdown_grace_secs: u64,
+    /// Browser origins allowed to call the API (the web UI). Empty disables CORS entirely.
+    #[serde(default)]
+    pub cors_origins: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

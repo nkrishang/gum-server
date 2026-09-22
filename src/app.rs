@@ -5,12 +5,14 @@ use std::time::Duration;
 use axum::error_handling::HandleErrorLayer;
 use axum::extract::{DefaultBodyLimit, Path, State};
 use axum::http::{HeaderName, StatusCode};
+use axum::http::{HeaderValue, Method, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{BoxError, Json, Router, middleware};
 use serde_json::json;
 use tower::ServiceBuilder;
 use tower_http::catch_panic::CatchPanicLayer;
+use tower_http::cors::CorsLayer;
 use tower_http::request_id::{MakeRequestUuid, PropagateRequestIdLayer, SetRequestIdLayer};
 use tower_http::timeout::TimeoutLayer;
 use tower_http::trace::TraceLayer;
@@ -68,6 +70,26 @@ pub fn router(state: AppState) -> Router {
             }
         });
 
+    // Browser clients (the web UI) live on another origin. Credentials travel in headers, never
+    // cookies, so no `allow_credentials`; an empty list turns the layer into a no-op.
+    let origins: Vec<HeaderValue> = cfg.cors_origins.iter().filter_map(|o| o.parse().ok()).collect();
+    let cors = if origins.is_empty() {
+        CorsLayer::new()
+    } else {
+        CorsLayer::new()
+            .allow_origin(origins)
+            .allow_methods([Method::GET, Method::POST, Method::PATCH, Method::DELETE])
+            .allow_headers([
+                header::AUTHORIZATION,
+                header::CONTENT_TYPE,
+                HeaderName::from_static("privy-id-token"),
+                HeaderName::from_static("x-api-key"),
+                HeaderName::from_static("idempotency-key"),
+            ])
+            .expose_headers([HeaderName::from_static("x-request-id"), HeaderName::from_static("idempotent-replayed")])
+            .max_age(Duration::from_secs(600))
+    };
+
     // Innermost first: metrics see the matched route; the timeout bounds handlers; load shedding
     // and the concurrency cap sit outside so shed requests are cheap; request ids are outermost
     // so every log line and response carries one.
@@ -89,6 +111,7 @@ pub fn router(state: AppState) -> Router {
                 .layer(tower::load_shed::LoadShedLayer::new())
                 .layer(tower::limit::ConcurrencyLimitLayer::new(cfg.max_in_flight)),
         )
+        .layer(cors)
         .layer(trace)
         .layer(CatchPanicLayer::custom(|_| ApiError::internal().into_response()))
         .layer(PropagateRequestIdLayer::new(request_id.clone()))
