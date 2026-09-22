@@ -31,7 +31,7 @@ pub struct Config {
 pub struct ServerConfig {
     pub bind: String,
     pub port: u16,
-    pub public_base_url: String,
+    pub callback_base_url: String,
     pub request_timeout_ms: u64,
     pub max_body_bytes: usize,
     pub max_in_flight: usize,
@@ -197,8 +197,8 @@ impl Config {
     /// Warnings for settings that are legal in development but will not work in production.
     pub fn production_warnings(&self) -> Vec<String> {
         let mut out = Vec::new();
-        if self.server.public_base_url.is_empty() {
-            out.push("server.public_base_url is empty: gum-indexer / gum-engine cannot call back".into());
+        if self.server.callback_base_url.is_empty() {
+            out.push("server.callback_base_url is empty: gum-indexer / gum-engine cannot call back".into());
         }
         if self.privy.app_id.is_empty() || self.privy.verification_key.is_empty() {
             out.push(

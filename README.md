@@ -200,7 +200,7 @@ Prometheus metrics: `gum_http_request_duration_seconds{route,method,status}`,
 | Variable | |
 |---|---|
 | `DATABASE_URL` | Postgres |
-| `GUM_SERVER__PUBLIC_BASE_URL` | This service's public origin; callbacks are `<origin>/v1/webhooks/{indexer,engine}` |
+| `GUM_SERVER__CALLBACK_BASE_URL` | Where gum-indexer / gum-engine call back: `<base>/v1/webhooks/{indexer,engine}`. Private network in production: `http://gum-server.railway.internal:8080` |
 | `GUM_PRIVY__APP_ID`, `GUM_PRIVY__VERIFICATION_KEY` | From the Privy dashboard (PEM; `\n` escapes accepted) |
 | `GUM_PAYMENTS__FACTORY_ADDRESS`, `GUM_PAYMENTS__RECOVERY_ADDRESS` | The `PaymentFactory` generation and our recovery wallet |
 | `GUM_INDEXER__BASE_URL`, `GUM_INDEXER__API_KEY`, `GUM_INDEXER__WEBHOOK_SECRET` | gum-indexer's private URL, one of its `GUM_API__KEYS`, its `GUM_WEBHOOK__SECRET` |
@@ -239,14 +239,20 @@ values observed from the real contracts on Anvil.
 ## Deploying
 
 Railway, EU West, via the Railway CLI (`railway up`); Railway builds the `Dockerfile`. Service settings
-(region, health check, replicas) live on Railway, not in the repo. The engine and indexer are on the same
-project's private network; reference them as `http://gum-engine.railway.internal:8080` and
-`http://gum-indexer.railway.internal:8080`.
+(region, health check, replicas, domains) live on Railway, not in the repo.
+
+**Topology.** gum-server, gum-indexer and gum-engine must be services of the **same Railway project and
+environment**: Railway private networking (`<service>.railway.internal`, IPv6, plain http on the port
+the service listens on) does not cross projects, gum-engine has no public domain or auth by design, and
+gum-indexer should not need one either. Only gum-server gets a public domain (`api.gum.money`), and
+only apps use it. Everything between the three services — API calls out, webhooks back — stays private.
 
 1. Add a Postgres plugin; Railway injects `DATABASE_URL`. Migrations run at boot (`database.auto_migrate`).
-2. Generate a public domain and set `GUM_SERVER__PUBLIC_BASE_URL` to it. Both upstreams need to reach
-   `/v1/webhooks/*`; gum-indexer additionally requires the webhook endpoint to be public `https`.
-3. Set the variables in the table above. Give gum-indexer's `GUM_WEBHOOK__SECRET` and gum-engine's
-   `webhook.signing_secret` to this service as `GUM_INDEXER__WEBHOOK_SECRET` / `GUM_ENGINE__WEBHOOK_SECRET`.
-4. On the service: region EU West (next to Postgres and the other two services), health check path
-   `/readyz`, restart on failure. Scale replicas freely.
+2. Set the variables in the table above (`.env.production` is a fill-in template). In particular
+   `GUM_SERVER__CALLBACK_BASE_URL=http://gum-server.railway.internal:8080` — the private address, not the
+   public domain. Give gum-indexer's `GUM_WEBHOOK__SECRET` and gum-engine's `webhook.signing_secret` to
+   this service as `GUM_INDEXER__WEBHOOK_SECRET` / `GUM_ENGINE__WEBHOOK_SECRET`.
+3. On gum-indexer and gum-engine set `GUM_WEBHOOK__HOST_ALLOWLIST=["gum-server.railway.internal"]` so
+   they deliver to the private callback host and nowhere else.
+4. On the service: region EU West (same as the other two and Postgres), health check path `/readyz`,
+   restart on failure, public domain `api.gum.money`. Scale replicas freely.

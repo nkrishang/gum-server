@@ -89,7 +89,7 @@ impl Harness {
         let base_url = format!("http://{addr}");
 
         let mut config = Config::load_unchecked(Path::new("config")).expect("config/default.toml must load");
-        config.server.public_base_url = base_url.clone();
+        config.server.callback_base_url = base_url.clone();
         config.database.url = db_url;
         config.privy.app_id = PRIVY_APP_ID.into();
         config.privy.verification_key = PUBLIC_KEY_PEM.into();

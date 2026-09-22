@@ -10,9 +10,11 @@
 [server]
 bind = "::"
 port = 8080
-# Public origin of this service; gum-indexer and gum-engine call back to
-# {public_base_url}/v1/webhooks/{indexer,engine}.
-public_base_url = ""
+# Base URL gum-indexer and gum-engine use to call back to this service:
+# {callback_base_url}/v1/webhooks/{indexer,engine}. All three services share one Railway project, so
+# this is the private-network address (http://gum-server.railway.internal:8080), never the public
+# api.gum.money domain. Public traffic (apps) only ever reaches /v1/deposit and friends.
+callback_base_url = ""
 request_timeout_ms = 10000
 max_body_bytes = 65536
 # Requests in flight before the server sheds load with 503.

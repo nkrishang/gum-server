@@ -72,7 +72,7 @@ impl AppState {
     }
 
     pub fn webhook_url(&self, path: &str) -> String {
-        format!("{}{path}", self.config.server.public_base_url.trim_end_matches('/'))
+        format!("{}{path}", self.config.server.callback_base_url.trim_end_matches('/'))
     }
 
     /// Returns `true` the first time `key` is seen within a minute.
