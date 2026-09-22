@@ -58,7 +58,7 @@ Key management routes require a Privy session so a leaked key cannot rotate itse
 POST /v1/deposit
 Idempotency-Key: <≤128 chars, optional but recommended>
 
-{ "chain": "base",                          // slug or id (8453); `chain_id` is accepted too
+{ "chain_id": "base",                       // id (8453) or slug
   "token": "USDC",                          // symbol or contract address; must be in the chain's registry
   "amount": "2500000",                      // base units, whole-number string; numbers and decimals are rejected
   "receiver": "0x…",                        // where the funds go; any non-zero address
