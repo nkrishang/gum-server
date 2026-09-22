@@ -238,8 +238,9 @@ values observed from the real contracts on Anvil.
 
 ## Deploying
 
-Railway, EU West, Dockerfile deploy (`railway.json`). The engine and indexer are on the same project's
-private network; reference them as `http://gum-engine.railway.internal:8080` and
+Railway, EU West, via the Railway CLI (`railway up`); Railway builds the `Dockerfile`. Service settings
+(region, health check, replicas) live on Railway, not in the repo. The engine and indexer are on the same
+project's private network; reference them as `http://gum-engine.railway.internal:8080` and
 `http://gum-indexer.railway.internal:8080`.
 
 1. Add a Postgres plugin; Railway injects `DATABASE_URL`. Migrations run at boot (`database.auto_migrate`).
@@ -247,5 +248,5 @@ private network; reference them as `http://gum-engine.railway.internal:8080` and
    `/v1/webhooks/*`; gum-indexer additionally requires the webhook endpoint to be public `https`.
 3. Set the variables in the table above. Give gum-indexer's `GUM_WEBHOOK__SECRET` and gum-engine's
    `webhook.signing_secret` to this service as `GUM_INDEXER__WEBHOOK_SECRET` / `GUM_ENGINE__WEBHOOK_SECRET`.
-4. Set the region to EU West on the service settings so it sits next to Postgres and the other two services.
-5. `/readyz` is the health check. Scale replicas freely.
+4. On the service: region EU West (next to Postgres and the other two services), health check path
+   `/readyz`, restart on failure. Scale replicas freely.
