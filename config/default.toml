@@ -1,0 +1,131 @@
+# gum-server base configuration.
+#
+# Secrets and endpoint URLs come from the environment as GUM_<SECTION>__<KEY>, e.g.
+#   GUM_SERVER__PUBLIC_BASE_URL, GUM_PRIVY__APP_ID, GUM_PRIVY__VERIFICATION_KEY,
+#   GUM_PAYMENTS__FACTORY_ADDRESS, GUM_PAYMENTS__RECOVERY_ADDRESS,
+#   GUM_INDEXER__BASE_URL, GUM_INDEXER__API_KEY, GUM_INDEXER__WEBHOOK_SECRET,
+#   GUM_ENGINE__BASE_URL, GUM_ENGINE__WEBHOOK_SECRET.
+# DATABASE_URL and PORT are read as-is (Railway provides both).
+
+[server]
+bind = "::"
+port = 8080
+# Public origin of this service; gum-indexer and gum-engine call back to
+# {public_base_url}/v1/webhooks/{indexer,engine}.
+public_base_url = ""
+request_timeout_ms = 10000
+max_body_bytes = 65536
+# Requests in flight before the server sheds load with 503.
+max_in_flight = 4096
+shutdown_grace_secs = 25
+
+[database]
+max_connections = 16
+min_connections = 2
+acquire_timeout_ms = 3000
+auto_migrate = true
+
+[privy]
+app_id = ""
+# PEM-encoded verification key from the Privy dashboard. "\n" escapes are accepted.
+verification_key = ""
+clock_skew_secs = 30
+
+[api_keys]
+# Keys are cached in memory after a successful lookup. A rotated key is refused on
+# this instance immediately and on other instances within this TTL.
+cache_ttl_secs = 30
+# Per-key token bucket.
+rate_limit_per_second = 50
+rate_limit_burst = 100
+
+[payments]
+# PaymentFactory address, identical on every supported chain (see gum-contracts Bootstrap.s.sol).
+factory_address = ""
+# Our privileged recovery address, passed as `recovery` to every payment.
+recovery_address = ""
+min_expiry_lead_secs = 300
+max_expiry_secs = 2592000
+
+[indexer]
+base_url = ""
+api_key = ""
+# gum-indexer's GUM_WEBHOOK__SECRET; used to verify inbound signatures.
+webhook_secret = ""
+timeout_ms = 5000
+
+[engine]
+base_url = ""
+# gum-engine's webhook.signing_secret; used to verify inbound signatures.
+webhook_secret = ""
+timeout_ms = 5000
+
+[webhooks]
+# How old an inbound X-Gum-Signature timestamp may be.
+inbound_tolerance_secs = 300
+# Production: app webhooks must be public https URLs.
+allow_insecure_targets = false
+connect_timeout_ms = 3000
+request_timeout_ms = 10000
+retry_base_ms = 1000
+retry_cap_ms = 3600000
+max_age_secs = 86400
+
+[outbox]
+workers = 8
+poll_interval_ms = 500
+batch_size = 32
+lock_ttl_secs = 60
+
+[reconciler]
+interval_secs = 60
+# A deposit in `paid` with no engine webhook for this long is polled directly.
+paid_stale_secs = 600
+idempotency_ttl_secs = 86400
+
+[admin]
+# Bearer token for /v1/admin routes. Empty disables them.
+token = ""
+
+# ---------------------------------------------------------------------------------------------
+# Chains and tokens. Must mirror gum-indexer's registry; adding one is a config-only change.
+# ---------------------------------------------------------------------------------------------
+
+[chains.monad]
+chain_id = 143
+
+[[chains.monad.tokens]]
+symbol = "USDC"
+address = "0x754704Bc059F8C67012fEd69BC8A327a5aafb603"
+decimals = 6
+
+[[chains.monad.tokens]]
+symbol = "USDT"
+address = "0xe7cd86e13AC4309349F30B3435a9d337750fC82D"
+decimals = 6
+
+[[chains.monad.tokens]]
+symbol = "AUSD"
+address = "0x00000000eFE302BEAA2b3e6e1b18d08D69a9012a"
+decimals = 6
+
+[chains.arbitrum]
+chain_id = 42161
+
+[[chains.arbitrum.tokens]]
+symbol = "USDC"
+address = "0xaf88d065e77c8cC2239327C5EDb3A432268e5831"
+decimals = 6
+
+[[chains.arbitrum.tokens]]
+symbol = "USDT"
+address = "0xFd086bC7CD5C481DCC9C85ebE478A1C0b69FCbb9"
+decimals = 6
+
+[chains.base]
+chain_id = 8453
+
+[[chains.base.tokens]]
+symbol = "USDC"
+address = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
+decimals = 6
