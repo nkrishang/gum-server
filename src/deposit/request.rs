@@ -17,7 +17,8 @@ use crate::webhooks::target;
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CreateDepositRequest {
-    /// Chain id (`8453`, as number or string) or slug (`"base"`).
+    /// Chain slug (`"base"`) or id (`8453`, as number or string). `chain` is accepted as an alias.
+    #[serde(alias = "chain")]
     pub chain_id: serde_json::Value,
     /// Token symbol (`"USDC"`) or contract address; must be supported on the chain.
     pub token: String,
@@ -356,6 +357,14 @@ mod tests {
         assert!(validate(with("reference", format!("0x{}", "ab".repeat(32)).into())).is_ok());
         assert!(validate(with("webhook_url", "http://localhost/x".into())).is_err());
         assert!(validate(with("webhook_url", "https://app.example.com/hooks".into())).is_ok());
+    }
+
+    #[test]
+    fn chain_is_an_alias_for_chain_id() {
+        let mut r = base_req();
+        r.as_object_mut().unwrap().remove("chain_id");
+        r["chain"] = "base".into();
+        assert_eq!(validate(r).unwrap().chain_id, 8453);
     }
 
     #[test]
