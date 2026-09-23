@@ -583,6 +583,16 @@ pub async fn retry_settlement(pool: &PgPool, id: Uuid) -> Result<Option<Deposit>
 }
 
 /// Deposits in `paid` that have not changed for `stale_secs`; the reconciler asks the engine.
+/// How many outbox jobs are due (ready to run, or running), and how long the oldest has been due.
+pub async fn outbox_due(pool: &PgPool) -> Result<(i64, f64), sqlx::Error> {
+    sqlx::query_as(
+        "SELECT count(*), COALESCE(EXTRACT(EPOCH FROM now() - min(next_attempt_at))::float8, 0) \
+         FROM outbox WHERE dead_at IS NULL AND next_attempt_at <= now()",
+    )
+    .fetch_one(pool)
+    .await
+}
+
 /// How many deposits are `paid` (settlement pending), and how long ago the oldest was submitted.
 pub async fn paid_backlog(pool: &PgPool) -> Result<(i64, f64), sqlx::Error> {
     sqlx::query_as(

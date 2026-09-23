@@ -5,8 +5,7 @@ use std::time::Duration;
 use anyhow::Context;
 use gum_server::config::Config;
 use gum_server::state::AppState;
-use gum_server::{MIGRATOR, app, outbox, reconciler, telemetry};
-use sqlx::postgres::PgPoolOptions;
+use gum_server::{app, db, outbox, reconciler, telemetry};
 use tokio::signal;
 use tokio_util::sync::CancellationToken;
 
@@ -20,17 +19,11 @@ async fn main() -> anyhow::Result<()> {
     }
     let metrics = telemetry::init_metrics()?;
 
-    let pool = PgPoolOptions::new()
-        .max_connections(config.database.max_connections)
-        .min_connections(config.database.min_connections)
-        .acquire_timeout(Duration::from_millis(config.database.acquire_timeout_ms))
-        .connect(&config.database.url)
-        .await
-        .context("connecting to postgres")?;
     if config.database.auto_migrate {
-        MIGRATOR.run(&pool).await.context("running migrations")?;
+        db::migrate(&config.database).await?;
         tracing::info!("migrations applied");
     }
+    let pool = db::connect(&config.database).await?;
 
     let ip: IpAddr = config.server.bind.parse().context("server.bind is not an IP address")?;
     let bind = SocketAddr::new(ip, config.server.port);
