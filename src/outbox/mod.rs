@@ -16,6 +16,7 @@ use serde_json::{Value, json};
 use sqlx::FromRow;
 use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
+use tracing::Instrument;
 use uuid::Uuid;
 
 use crate::chain::payment::PaymentTerms;
@@ -166,7 +167,10 @@ async fn run_bounded(state: AppState, job: OutboxJob, limit: Duration) {
 
 async fn execute(state: AppState, job: OutboxJob) {
     let span = tracing::info_span!("outbox_job", job_id = %job.id, kind = %job.kind, deposit_id = %job.deposit_id, attempt = job.attempts);
-    let _guard = span.enter();
+    execute_job(state, job).instrument(span).await
+}
+
+async fn execute_job(state: AppState, job: OutboxJob) {
     let started = Instant::now();
     metrics::histogram!("gum_outbox_lag_seconds", "kind" => job.kind.clone())
         .record((Utc::now() - job.created_at).num_milliseconds().max(0) as f64 / 1000.0);

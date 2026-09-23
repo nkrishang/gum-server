@@ -5,13 +5,14 @@ use std::time::Duration;
 use anyhow::Context;
 use gum_server::config::Config;
 use gum_server::state::AppState;
-use gum_server::{app, db, outbox, reconciler, telemetry};
+use gum_server::{app, db, outbox, reconciler, supervise, telemetry};
 use tokio::signal;
 use tokio_util::sync::CancellationToken;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     telemetry::init_tracing();
+    telemetry::init_panic_hook();
     let config_dir = std::env::var("GUM_CONFIG_DIR").map(PathBuf::from).unwrap_or_else(|_| PathBuf::from("config"));
     let config = Config::load(&config_dir)?;
     for warning in config.production_warnings() {
@@ -32,8 +33,14 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!(chains = ?state.registry.chain_ids(), factory = %state.factory, recovery = %state.recovery, "gum-server configured");
 
     let shutdown = CancellationToken::new();
-    let workers = tokio::spawn(outbox::run(state.clone(), shutdown.clone()));
-    let reconciler = tokio::spawn(reconciler::run(state.clone(), shutdown.clone()));
+    let workers = {
+        let (state, shutdown) = (state.clone(), shutdown.clone());
+        supervise::spawn("outbox", shutdown.clone(), move || outbox::run(state.clone(), shutdown.clone()))
+    };
+    let reconciler = {
+        let (state, shutdown) = (state.clone(), shutdown.clone());
+        supervise::spawn("reconciler", shutdown.clone(), move || reconciler::run(state.clone(), shutdown.clone()))
+    };
 
     let listener = tokio::net::TcpListener::bind(bind).await.with_context(|| format!("binding {bind}"))?;
     tracing::info!(%bind, "listening");

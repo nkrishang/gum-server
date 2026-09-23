@@ -24,6 +24,32 @@ pub fn init_tracing() {
     }
 }
 
+/// Panics become a structured error line and `gum_panics_total`. The default hook prints plain
+/// text to stderr, which log search and alerting missed while panics were killing the outbox task
+/// (2026-09-23). Written directly rather than through `tracing`: the panic may have come from
+/// inside the subscriber itself.
+pub fn init_panic_hook() {
+    std::panic::set_hook(Box::new(|info| {
+        metrics::counter!("gum_panics_total").increment(1);
+        let payload = info
+            .payload()
+            .downcast_ref::<&str>()
+            .map(|s| (*s).to_owned())
+            .or_else(|| info.payload().downcast_ref::<String>().cloned())
+            .unwrap_or_default();
+        let line = serde_json::json!({
+            "timestamp": chrono::Utc::now(),
+            "level": "ERROR",
+            "message": "panic",
+            "panic": payload,
+            "location": info.location().map(|l| format!("{}:{}", l.file(), l.line())),
+            "thread": std::thread::current().name(),
+            "target": "gum_server::panic",
+        });
+        eprintln!("{line}");
+    }));
+}
+
 pub fn init_metrics() -> anyhow::Result<PrometheusHandle> {
     let handle = PrometheusBuilder::new()
         .set_buckets_for_metric(
@@ -53,6 +79,8 @@ fn describe() {
     describe_counter!("gum_app_webhook_deliveries_total", "Deliveries to app webhooks by outcome");
     describe_counter!("gum_auth_total", "Authentication attempts by method and outcome");
     describe_counter!("gum_db_errors_total", "Database errors");
+    describe_counter!("gum_panics_total", "Panics anywhere in the process");
+    describe_counter!("gum_task_restarts_total", "Background tasks restarted after stopping unexpectedly");
 }
 
 /// Per-request latency/count metrics keyed by the matched route template, never the raw path.
