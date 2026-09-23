@@ -20,6 +20,7 @@ use axum::http::{HeaderMap, StatusCode};
 use chrono::Utc;
 use serde::Deserialize;
 use serde_json::{Value, json};
+use tracing::Instrument;
 use uuid::Uuid;
 
 use super::sign;
@@ -99,8 +100,10 @@ pub async fn indexer(State(state): State<AppState>, headers: HeaderMap, body: By
     verify(&state, "indexer", &state.config.indexer.webhook_secret, &headers, &body)?;
     let event: IndexerEvent = parse("indexer", &body)?;
     let span = tracing::info_span!("indexer_event", event_id = %event.id, event_type = %event.event_type, watch_id = %event.watch.id);
-    let _guard = span.enter();
+    apply_indexer_event(state, event).instrument(span).await
+}
 
+async fn apply_indexer_event(state: AppState, event: IndexerEvent) -> Result<StatusCode, ApiError> {
     let mut tx = state.pool.begin().await?;
     if !store::claim_inbound(&mut tx, "indexer", &event.id).await? {
         metrics::counter!("gum_inbound_webhooks_total", "source" => "indexer", "outcome" => "duplicate").increment(1);
@@ -204,8 +207,10 @@ pub async fn engine(State(state): State<AppState>, headers: HeaderMap, body: Byt
     verify(&state, "engine", &state.config.engine.webhook_secret, &headers, &body)?;
     let event: EngineEvent = parse("engine", &body)?;
     let span = tracing::info_span!("engine_event", event_id = %event.event_id, event_type = %event.event, job_id = %event.job_id);
-    let _guard = span.enter();
+    apply_engine_event(state, event).instrument(span).await
+}
 
+async fn apply_engine_event(state: AppState, event: EngineEvent) -> Result<StatusCode, ApiError> {
     let mut tx = state.pool.begin().await?;
     if !store::claim_inbound(&mut tx, "engine", &event.event_id).await? {
         metrics::counter!("gum_inbound_webhooks_total", "source" => "engine", "outcome" => "duplicate").increment(1);

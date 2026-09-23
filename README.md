@@ -201,7 +201,10 @@ Prometheus metrics: `gum_http_request_duration_seconds{route,method,status}`,
 `gum_outbox_lag_seconds`, `gum_outbox_jobs_total{kind,outcome}`,
 `gum_upstream_request_duration_seconds{service,op,outcome}`, `gum_app_webhook_deliveries_total{outcome}`,
 `gum_auth_total{method,outcome}`, `gum_db_errors_total`, `gum_deposits_paid`,
-`gum_deposits_paid_oldest_age_seconds`, `gum_outbox_due`, `gum_outbox_oldest_due_age_seconds`.
+`gum_deposits_paid_oldest_age_seconds`, `gum_outbox_due`, `gum_outbox_oldest_due_age_seconds`,
+`gum_panics_total`, `gum_task_restarts_total{task}`. Alert on any panic or task restart: the outbox and
+reconciler run under a supervisor that restarts them (`background task stopped unexpectedly`), and panics
+are logged as structured `"message":"panic"` errors.
 Alert on `gum_outbox_dead > 0`, on `gum_outbox_lag_seconds` p99, on `/readyz` flipping, on
 `gum_deposits_paid_oldest_age_seconds` above a few minutes (settlement takes seconds, so an old
 `paid` deposit means engine webhooks are not landing), and on

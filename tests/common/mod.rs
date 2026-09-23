@@ -13,7 +13,7 @@ use chrono::Utc;
 use gum_server::config::{ChainConfig, Config, TokenConfig};
 use gum_server::state::AppState;
 use gum_server::webhooks::sign;
-use gum_server::{app, outbox, reconciler};
+use gum_server::{app, outbox, reconciler, supervise};
 use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
 use serde::Serialize;
 use sqlx::PgPool;
@@ -134,8 +134,14 @@ impl Harness {
             .expect("db");
         let state = AppState::new(config, pool.clone(), metrics).expect("state");
         let shutdown = CancellationToken::new();
-        tokio::spawn(outbox::run(state.clone(), shutdown.clone()));
-        tokio::spawn(reconciler::run(state.clone(), shutdown.clone()));
+        {
+            let (state, shutdown) = (state.clone(), shutdown.clone());
+            supervise::spawn("outbox", shutdown.clone(), move || outbox::run(state.clone(), shutdown.clone()));
+        }
+        {
+            let (state, shutdown) = (state.clone(), shutdown.clone());
+            supervise::spawn("reconciler", shutdown.clone(), move || reconciler::run(state.clone(), shutdown.clone()));
+        }
         let router = app::router(state.clone());
         let server_shutdown = shutdown.clone();
         tokio::spawn(async move {

@@ -23,6 +23,7 @@ pub mod error;
 pub mod outbox;
 pub mod reconciler;
 pub mod state;
+pub mod supervise;
 pub mod telemetry;
 pub mod webhooks;
 
