@@ -31,6 +31,12 @@ max_connections = 32
 min_connections = 2
 acquire_timeout_ms = 3000
 auto_migrate = true
+# No database wait is unbounded (see src/db.rs). A statement waiting on a row lock gives up after
+# lock_timeout_ms, any statement after statement_timeout_ms, and a transaction left open is ended
+# after idle_in_transaction_timeout_ms. Callers retry (outbox) or answer 503 (requests).
+statement_timeout_ms = 30000
+lock_timeout_ms = 5000
+idle_in_transaction_timeout_ms = 60000
 
 [privy]
 app_id = ""
@@ -82,6 +88,9 @@ workers = 8
 poll_interval_ms = 500
 batch_size = 32
 lock_ttl_secs = 60
+# A job still running after this is abandoned and retried, so one stuck job cannot hold up the
+# outbox (e.g. a query on a connection that died without closing). Must be below lock_ttl_secs.
+job_timeout_ms = 30000
 # Jobs towards gum-indexer / gum-engine are on the settlement's critical path: short backoff cap,
 # retried until the deposit is terminal. App webhooks use [webhooks] retry_cap_ms / max_age_secs.
 upstream_retry_cap_ms = 30000

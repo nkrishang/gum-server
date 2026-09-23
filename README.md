@@ -187,6 +187,11 @@ POST /v1/admin/outbox/{id}/requeue
   indexer's say-so only happens a full day after `expires_at`.
 - **Backpressure and limits.** Per-key token buckets, a body limit, a request timeout, a concurrency
   cap with load shedding (`503 shedding`), panic isolation, graceful drain on SIGTERM.
+- **No unbounded waits.** Every pooled connection carries `statement_timeout`, `lock_timeout` and
+  `idle_in_transaction_session_timeout` (`database.*_ms`), so a statement stuck behind a lock or a
+  transaction left open fails instead of waiting forever. Each outbox job runs under
+  `outbox.job_timeout_ms` (30 s) and is rescheduled if it overruns, which also covers a connection
+  that died without closing. Migrations run on their own connection without these limits.
 - **Multiple replicas are safe.** Outbox claims use `FOR UPDATE SKIP LOCKED`; every write is idempotent.
 
 Observability: single-line JSON logs on stdout (`RUST_LOG`; `GUM_LOG_FORMAT=pretty` locally), and
@@ -196,10 +201,13 @@ Prometheus metrics: `gum_http_request_duration_seconds{route,method,status}`,
 `gum_outbox_lag_seconds`, `gum_outbox_jobs_total{kind,outcome}`,
 `gum_upstream_request_duration_seconds{service,op,outcome}`, `gum_app_webhook_deliveries_total{outcome}`,
 `gum_auth_total{method,outcome}`, `gum_db_errors_total`, `gum_deposits_paid`,
-`gum_deposits_paid_oldest_age_seconds`. Alert on `gum_outbox_dead > 0`, on `gum_outbox_lag_seconds`
-p99, on `/readyz` flipping, and on `gum_deposits_paid_oldest_age_seconds` above a few minutes:
-settlement takes seconds, so an old `paid` deposit means engine webhooks are not landing — which
-`/readyz` does not show.
+`gum_deposits_paid_oldest_age_seconds`, `gum_outbox_due`, `gum_outbox_oldest_due_age_seconds`.
+Alert on `gum_outbox_dead > 0`, on `gum_outbox_lag_seconds` p99, on `/readyz` flipping, on
+`gum_deposits_paid_oldest_age_seconds` above a few minutes (settlement takes seconds, so an old
+`paid` deposit means engine webhooks are not landing), and on
+`gum_outbox_oldest_due_age_seconds` above a minute or two: the outbox is not draining (logged as
+`outbox is not draining` past 120 s). Neither shows on `/readyz`. Both gauges are computed by the
+reconciler, independently of the outbox itself.
 
 ## Configuration
 

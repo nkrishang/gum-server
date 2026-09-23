@@ -1082,3 +1082,126 @@ async fn engine_events_for_jobs_not_recorded_yet_are_retried() {
     let old = engine_event("old-1", "transaction.included", None, None, None);
     assert_eq!(h.deliver("/v1/webhooks/engine", ENGINE_SECRET, &old).await.status(), 200);
 }
+
+/// Mounts upstreams whose watch registration takes `delay`, leaving time to interfere with a job
+/// while it is in flight.
+async fn mount_slow_watch_registration(h: &Harness, delay: Duration) {
+    Mock::given(method("POST"))
+        .and(path("/v1/watches"))
+        .respond_with(
+            ResponseTemplate::new(201)
+                .set_body_json(json!({
+                    "id": WATCH_ID, "chain": "anvil", "chain_id": 31337, "token": "USDC", "token_address": USDC,
+                    "payment_address": "0x0000000000000000000000000000000000000001", "balance_threshold": "2500000",
+                    "confirmed_amount": "0", "status": "active", "webhook_endpoint": "x", "start_block": 1,
+                    "created_at": Utc::now(), "expires_at": null, "completed_at": null
+                }))
+                .set_delay(delay),
+        )
+        .mount(&h.indexer)
+        .await;
+}
+
+async fn watch_id(h: &Harness, id: Uuid) -> Option<Uuid> {
+    sqlx::query_as::<_, (Option<Uuid>,)>("SELECT watch_id FROM deposits WHERE id = $1")
+        .bind(id)
+        .fetch_one(&h.pool)
+        .await
+        .unwrap()
+        .0
+}
+
+/// Regression for the 2026-09-23 stall: one outbox job waited on the database with no limit, and
+/// because the outbox finishes a batch before claiming the next, no watch was registered and no
+/// settlement submitted until the process was restarted. Here deposit A's job is held on a row
+/// lock taken from outside the service; deposit B must still be processed, and A once released.
+async fn stuck_job_does_not_freeze_the_outbox(tweak: impl FnOnce(&mut gum_server::config::Config)) {
+    let Some(h) = Harness::start_with(sqlx::postgres::PgPoolOptions::new().max_connections(8), tweak).await else {
+        eprintln!("TEST_DATABASE_URL not set; skipping");
+        return;
+    };
+    mount_slow_watch_registration(&h, Duration::from_millis(500)).await;
+    let key = h.api_key_for("did:privy:gina").await;
+    let create = || async {
+        let created: Value = h
+            .http
+            .post(h.url("/v1/deposit"))
+            .bearer_auth(&key)
+            .json(&deposit_body())
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        created["id"].as_str().unwrap().parse::<Uuid>().unwrap()
+    };
+
+    // A's registration is in flight (the indexer answers after 500 ms); lock its row meanwhile.
+    let a = create().await;
+    let mut blocker = h.pool.begin().await.unwrap();
+    sqlx::query("SELECT 1 FROM deposits WHERE id = $1 FOR UPDATE").bind(a).execute(&mut *blocker).await.unwrap();
+
+    let b = create().await;
+    h.wait_for("B's watch while A is stuck", Duration::from_secs(10), || async { watch_id(&h, b).await }).await;
+    assert_eq!(watch_id(&h, a).await, None, "A cannot have been registered while its row is locked");
+
+    blocker.rollback().await.unwrap();
+    h.wait_for("A's watch once released", Duration::from_secs(15), || async { watch_id(&h, a).await }).await;
+}
+
+/// Postgres gives up on the lock wait (`lock_timeout`) and the job is retried.
+#[tokio::test]
+async fn a_job_blocked_on_a_row_lock_does_not_freeze_the_outbox() {
+    stuck_job_does_not_freeze_the_outbox(|c| c.database.lock_timeout_ms = 300).await;
+}
+
+/// With no database limits at all (e.g. a connection that died without closing never answers),
+/// the job's own time limit abandons it and the outbox moves on.
+#[tokio::test]
+async fn a_job_that_never_returns_is_abandoned() {
+    stuck_job_does_not_freeze_the_outbox(|c| {
+        c.database.lock_timeout_ms = 0;
+        c.database.statement_timeout_ms = 0;
+        c.outbox.job_timeout_ms = 1_000;
+    })
+    .await;
+}
+
+/// The reconciler measures the outbox from outside: a due job that is not being worked off shows
+/// up in `gum_outbox_oldest_due_age_seconds` (and an error log past two minutes).
+#[tokio::test]
+async fn the_outbox_backlog_is_measured_from_outside() {
+    let h = harness!();
+    mount_upstreams(&h).await;
+    let key = h.api_key_for("did:privy:hank").await;
+    let created: Value = h
+        .http
+        .post(h.url("/v1/deposit"))
+        .bearer_auth(&key)
+        .json(&deposit_body())
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let id: Uuid = created["id"].as_str().unwrap().parse().unwrap();
+    h.wait_for("watch", Duration::from_secs(5), || async { watch_id(&h, id).await }).await;
+    assert_eq!(gum_server::deposit::store::outbox_due(&h.pool).await.unwrap().0, 0, "drained");
+
+    // A job that has been due for five minutes and is held by a worker that never finishes.
+    sqlx::query(
+        "INSERT INTO outbox (id, kind, deposit_id, next_attempt_at, locked_until) \
+         VALUES ($1, 'notify_app', $2, now() - interval '5 minutes', now() + interval '1 hour')",
+    )
+    .bind(Uuid::now_v7())
+    .bind(id)
+    .execute(&h.pool)
+    .await
+    .unwrap();
+    let (due, oldest) = gum_server::deposit::store::outbox_due(&h.pool).await.unwrap();
+    assert_eq!(due, 1);
+    assert!(oldest > gum_server::reconciler::OUTBOX_STALL_SECS, "{oldest}");
+    gum_server::reconciler::tick(&h.state).await.unwrap();
+}
