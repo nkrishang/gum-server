@@ -112,6 +112,9 @@ pub struct OutboxConfig {
 pub struct ReconcilerConfig {
     pub interval_secs: u64,
     pub paid_stale_secs: i64,
+    /// Minimum gap between two polls of the same `paid` deposit, and after any webhook for it.
+    #[serde(default = "default_paid_repoll_secs")]
+    pub paid_repoll_secs: i64,
     pub open_stale_secs: i64,
     pub idempotency_ttl_secs: i64,
 }
@@ -232,4 +235,8 @@ fn parse_nonzero_address(raw: &str) -> anyhow::Result<Address> {
         bail!("must not be the zero address");
     }
     Ok(address)
+}
+
+fn default_paid_repoll_secs() -> i64 {
+    30
 }

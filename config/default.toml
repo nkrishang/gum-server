@@ -25,7 +25,9 @@ shutdown_grace_secs = 25
 cors_origins = []
 
 [database]
-max_connections = 16
+# Bursts need headroom: up to 16 engine + 8 indexer webhooks at once, 8 outbox workers, the
+# reconciler, and API traffic. Each of those holds one connection at a time.
+max_connections = 32
 min_connections = 2
 acquire_timeout_ms = 3000
 auto_migrate = true
@@ -86,8 +88,12 @@ upstream_retry_cap_ms = 30000
 
 [reconciler]
 interval_secs = 60
-# A deposit in `paid` with no engine webhook for this long is polled directly.
-paid_stale_secs = 600
+# A deposit still in `paid` this long after its settlement was submitted is polled from the
+# engine. Settlement takes seconds on every supported chain, so a minute means a webhook was lost.
+# Measured from the submission, so late webhooks for the job do not push the poll back.
+paid_stale_secs = 60
+# ...and polled again at most this often (also the quiet period after any webhook for it).
+paid_repoll_secs = 30
 # An open deposit (pending / partial_paid) that has not changed for this long is checked against
 # the indexer's watch, in case a payment.* / threshold.reached delivery was lost.
 open_stale_secs = 900

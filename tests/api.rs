@@ -717,8 +717,13 @@ async fn health_and_reference_routes() {
     assert_eq!(res.json::<Value>().await.unwrap()["error"]["code"], "not_found");
 }
 
+/// Backdates a deposit's last change (and its engine submission, if any) by `secs`.
 async fn age(pool: &sqlx::PgPool, id: Uuid, secs: i64) {
-    sqlx::query("UPDATE deposits SET updated_at = now() - make_interval(secs => $2) WHERE id = $1")
+    sqlx::query(
+        "UPDATE deposits SET updated_at = now() - make_interval(secs => $2), \
+         engine_submitted_at = CASE WHEN engine_submitted_at IS NULL THEN NULL ELSE now() - make_interval(secs => $2) END \
+         WHERE id = $1",
+    )
         .bind(id)
         .bind(secs as f64)
         .execute(pool)
@@ -921,4 +926,159 @@ async fn reconciler_recovers_lost_webhooks() {
     assert_eq!(watch_id.to_string(), WATCH_ID);
     let posts = h.indexer.received_requests().await.unwrap().iter().filter(|r| r.method == "POST").count();
     assert_eq!(posts, watches_before + 1);
+}
+
+/// Fires `bodies` at `path` all at once, the way gum-engine / gum-indexer deliver a backlog after a
+/// burst, and returns every response status.
+async fn deliver_concurrently(h: &Harness, path: &str, secret: &'static str, bodies: Vec<Value>) -> Vec<u16> {
+    let mut tasks = tokio::task::JoinSet::new();
+    for body in bodies {
+        let (http, url) = (h.http.clone(), h.url(path));
+        tasks.spawn(async move {
+            let raw = serde_json::to_vec(&body).unwrap();
+            let signature = sign::signature_header(secret, Utc::now().timestamp(), &raw);
+            http.post(url)
+                .header("content-type", "application/json")
+                .header("x-gum-signature", signature)
+                .body(raw)
+                .send()
+                .await
+                .unwrap()
+                .status()
+                .as_u16()
+        });
+    }
+    tasks.join_all().await
+}
+
+/// Regression for the 2026-09-23 Monad incident: a burst of inbound webhooks larger than the
+/// connection pool must queue for connections, not deadlock. Each handler used to open its
+/// transaction (one connection) and then look the deposit up on the pool (a second connection),
+/// so pool-size concurrent deliveries each held one connection while waiting for another, until
+/// the acquire timeout answered all of them 503.
+#[tokio::test]
+async fn webhook_bursts_larger_than_the_pool_do_not_deadlock() {
+    let pool = sqlx::postgres::PgPoolOptions::new().max_connections(4).acquire_timeout(Duration::from_secs(2));
+    let Some(h) = Harness::start_with_pool(pool).await else {
+        eprintln!("TEST_DATABASE_URL not set; skipping");
+        return;
+    };
+    const BURST: usize = 24;
+
+    let engine: Vec<Value> = (0..BURST)
+        .map(|i| engine_event(&format!("burst-engine-{i}"), "transaction.included", None, None, None))
+        .collect();
+    let indexer: Vec<Value> = (0..BURST)
+        .map(|i| {
+            indexer_event(
+                &format!("burst-indexer-{i}"),
+                "payment.pending",
+                "0x0000000000000000000000000000000000000001",
+                "0",
+                None,
+            )
+        })
+        .collect();
+    let (engine, indexer) = tokio::join!(
+        deliver_concurrently(&h, "/v1/webhooks/engine", ENGINE_SECRET, engine),
+        deliver_concurrently(&h, "/v1/webhooks/indexer", INDEXER_SECRET, indexer),
+    );
+    assert!(engine.iter().all(|s| *s == 200), "engine webhooks: {engine:?}");
+    assert!(indexer.iter().all(|s| *s == 200), "indexer webhooks: {indexer:?}");
+}
+
+/// Creates a deposit and drives it to `paid` with its settlement submitted to the (mock) engine.
+async fn paid_deposit(h: &Harness, key: &str) -> (Uuid, String) {
+    let created: Value = h
+        .http
+        .post(h.url("/v1/deposit"))
+        .bearer_auth(key)
+        .json(&deposit_body())
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let id: Uuid = created["id"].as_str().unwrap().parse().unwrap();
+    let payment_address = created["payment_address"].as_str().unwrap().to_owned();
+    for (event_id, event_type) in [("pd-1", "payment.confirmed"), ("pd-2", "threshold.reached")] {
+        let ev = indexer_event(&format!("{event_id}-{id}"), event_type, &payment_address, "2500000", None);
+        assert_eq!(h.deliver("/v1/webhooks/indexer", INDEXER_SECRET, &ev).await.status(), 200);
+    }
+    assert_eq!(h.deposit_status(id).await, "paid");
+    h.wait_for("engine submission", Duration::from_secs(5), || async {
+        sqlx::query_as::<_, (Option<Uuid>,)>("SELECT engine_job_id FROM deposits WHERE id = $1")
+            .bind(id)
+            .fetch_one(&h.pool)
+            .await
+            .unwrap()
+            .0
+    })
+    .await;
+    (id, payment_address)
+}
+
+/// Regression for the 2026-09-23 Monad incident: the reconciler measured staleness from the
+/// deposit's last change, so a `transaction.included` delivered minutes late restarted a 10-minute
+/// wait before the deposit was polled. It now counts from the settlement's submission.
+#[tokio::test]
+async fn late_engine_webhooks_do_not_postpone_the_reconciler() {
+    let h = harness!();
+    mount_upstreams(&h).await;
+    let key = h.api_key_for("did:privy:frank").await;
+    let (id, payment_address) = paid_deposit(&h, &key).await;
+    Mock::given(method("GET"))
+        .and(path(format!("/v1/transactions/{JOB_ID}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "job_id": JOB_ID, "chain_id": 31337, "status": "confirmed", "outcome": "success",
+            "tx_hash": "0xe15d10f3812c0d9a6c0d30cf5e84868309e0cc28b0fd7272f03df90ca4de222c", "block_number": 5,
+            "receipt": settled_receipt(&payment_address), "error": null
+        })))
+        .mount(&h.engine)
+        .await;
+
+    // Submitted five minutes ago; the `included` event only now arrives, late.
+    age(&h.pool, id, 300).await;
+    let late =
+        engine_event("late-1", "transaction.included", Some("success"), Some(settled_receipt(&payment_address)), None);
+    assert_eq!(h.deliver("/v1/webhooks/engine", ENGINE_SECRET, &late).await.status(), 200);
+    assert_eq!(h.deposit_status(id).await, "paid");
+
+    // Right after a webhook the deposit is left alone for `paid_repoll_secs`...
+    gum_server::reconciler::tick(&h.state).await.unwrap();
+    assert_eq!(h.deposit_status(id).await, "paid");
+    assert!(!h.engine.received_requests().await.unwrap().iter().any(|r| r.method == "GET"), "polled too soon");
+
+    // ...and polled once that has passed, not `paid_stale_secs` after the late webhook.
+    sqlx::query("UPDATE deposits SET updated_at = now() - make_interval(secs => $2) WHERE id = $1")
+        .bind(id)
+        .bind((h.state.config.reconciler.paid_repoll_secs + 1) as f64)
+        .execute(&h.pool)
+        .await
+        .unwrap();
+    gum_server::reconciler::tick(&h.state).await.unwrap();
+    assert_eq!(h.deposit_status(id).await, "settled");
+}
+
+/// The engine can report a job before our outbox has recorded its id (it includes the
+/// transaction in well under a second on Monad). That event must be retried, not acknowledged and
+/// lost; an unknown job older than the grace period is not ours and is acknowledged.
+#[tokio::test]
+async fn engine_events_for_jobs_not_recorded_yet_are_retried() {
+    let h = harness!();
+    let mut ev = engine_event("early-1", "transaction.included", None, None, None);
+    ev["job_id"] = json!(Uuid::now_v7());
+    let res = h.deliver("/v1/webhooks/engine", ENGINE_SECRET, &ev).await;
+    assert_eq!(res.status(), 503);
+    assert_eq!(res.json::<Value>().await.unwrap()["error"]["code"], "job_not_recorded_yet");
+    // The claim was rolled back, so the retry is processed rather than dropped as a duplicate.
+    let (claimed,): (i64,) = sqlx::query_as("SELECT count(*) FROM inbound_events WHERE event_id = 'early-1'")
+        .fetch_one(&h.pool)
+        .await
+        .unwrap();
+    assert_eq!(claimed, 0);
+
+    let old = engine_event("old-1", "transaction.included", None, None, None);
+    assert_eq!(h.deliver("/v1/webhooks/engine", ENGINE_SECRET, &old).await.status(), 200);
 }

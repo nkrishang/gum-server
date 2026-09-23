@@ -69,13 +69,19 @@ async fn fresh_database(admin_url: &str) -> String {
 
 impl Harness {
     pub async fn start() -> Option<Self> {
+        Self::start_with_pool(PgPoolOptions::new().max_connections(8)).await
+    }
+
+    /// Like `start`, with the server's connection pool built from `pool_options` (to test behaviour
+    /// when the pool is small or contended).
+    pub async fn start_with_pool(pool_options: PgPoolOptions) -> Option<Self> {
         let admin_url = test_database_url()?;
         let _ = tracing_subscriber::fmt()
             .with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "warn".into()))
             .with_test_writer()
             .try_init();
         let db_url = fresh_database(&admin_url).await;
-        let pool = PgPoolOptions::new().max_connections(8).connect(&db_url).await.expect("db");
+        let pool = pool_options.connect(&db_url).await.expect("db");
         MIGRATOR.run(&pool).await.expect("migrations");
 
         let indexer = MockServer::start().await;
