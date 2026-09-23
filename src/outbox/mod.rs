@@ -302,6 +302,7 @@ async fn register_watch(state: &AppState, job: &OutboxJob) -> Attempt {
         balance_threshold: deposit.amount.clone(),
         webhook_endpoint: &endpoint,
         expires_at: deposit.expires_at,
+        payments_since: deposit.created_at,
     };
     match state.indexer.create_watch(&req).await {
         Ok(watch) => {

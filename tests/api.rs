@@ -158,6 +158,14 @@ async fn full_deposit_lifecycle() {
     assert_eq!(watch_body["token"], USDC.to_ascii_lowercase());
     assert_eq!(watch_body["webhook_endpoint"], format!("{}/v1/webhooks/indexer", h.base_url));
     assert_eq!(watch_body["expires_at"].as_str().unwrap(), created["expires_at"].as_str().unwrap());
+    // Payments made before the watch exists (a lagging outbox) are still counted by the indexer.
+    let since = chrono::DateTime::parse_from_rfc3339(watch_body["payments_since"].as_str().unwrap()).unwrap();
+    let (created_at,): (chrono::DateTime<Utc>,) =
+        sqlx::query_as("SELECT created_at FROM deposits WHERE id = $1").bind(id).fetch_one(&h.pool).await.unwrap();
+    assert!(
+        (since.with_timezone(&Utc) - created_at).num_milliseconds().abs() < 1,
+        "payments_since is the deposit's creation time"
+    );
 
     // 3. gum-indexer sees a transfer at chain head.
     let transfer = json!({ "tx_hash": "0x11", "log_index": 1, "block_number": 10, "block_hash": "0x22", "from": "0x0000000000000000000000000000000000000009", "amount": "2500000", "status": "pending" });
