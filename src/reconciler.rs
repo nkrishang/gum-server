@@ -120,7 +120,14 @@ async fn reconcile_open(state: &AppState) -> anyhow::Result<()> {
 }
 
 async fn reconcile_paid(state: &AppState) -> anyhow::Result<()> {
-    let stale = store::stale_paid(&state.pool, state.config.reconciler.paid_stale_secs, BATCH).await?;
+    // Alert on this: settlement takes seconds, so a `paid` deposit minutes old means the engine's
+    // webhooks are not landing (as in the 2026-09-23 incident, when nothing else looked unhealthy).
+    let (paid, oldest_secs) = store::paid_backlog(&state.pool).await?;
+    metrics::gauge!("gum_deposits_paid").set(paid as f64);
+    metrics::gauge!("gum_deposits_paid_oldest_age_seconds").set(oldest_secs);
+
+    let cfg = &state.config.reconciler;
+    let stale = store::stale_paid(&state.pool, cfg.paid_stale_secs, cfg.paid_repoll_secs, BATCH).await?;
     for deposit in stale {
         let Some(job_id) = deposit.engine_job_id else { continue };
         let job = match state.engine.get_job(job_id).await {

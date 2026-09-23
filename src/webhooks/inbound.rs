@@ -6,7 +6,12 @@
 //! notifying the app) is queued to the outbox, never done on the sender's clock.
 //!
 //! `200` for an event we cannot map to a deposit (a watch we did not create, a job that is not
-//! ours): retrying would not help. `503` on database trouble: retrying will.
+//! ours): retrying would not help. `503` on database trouble: retrying will. Also `503` for an
+//! engine job we do not know *yet*: the engine can report a job before our outbox has recorded
+//! its id, and acknowledging that event would lose it.
+//!
+//! A handler uses exactly one connection: its transaction. Every query runs on it, never on the
+//! pool, or a burst of pool-size deliveries deadlocks waiting for second connections.
 
 use alloy_primitives::{Address, B256, U256};
 use axum::body::Bytes;
@@ -26,6 +31,10 @@ use crate::state::AppState;
 /// Engine failure codes worth an automatic resubmission: the transaction never executed.
 const RETRYABLE_ENGINE_ERRORS: &[&str] = &["expired", "stuck_cancelled", "internal"];
 const MAX_AUTO_RETRIES: i64 = 3;
+/// An engine event for a job we have no record of is retried (503) while the job is younger than
+/// this: our outbox records the job id only after the engine accepts it, and on a fast chain the
+/// engine can include the transaction and report it first. Older unknown jobs are not ours.
+const UNKNOWN_JOB_GRACE_SECS: u64 = 600;
 
 fn verify(
     state: &AppState,
@@ -97,10 +106,10 @@ pub async fn indexer(State(state): State<AppState>, headers: HeaderMap, body: By
         metrics::counter!("gum_inbound_webhooks_total", "source" => "indexer", "outcome" => "duplicate").increment(1);
         return Ok(StatusCode::OK);
     }
-    let deposit = match store::get_by_watch(&state.pool, event.watch.id).await? {
+    let deposit = match store::get_by_watch(&mut tx, event.watch.id).await? {
         Some(d) => Some(d),
         // The watch id is written by an outbox job; the first event can beat it.
-        None => store::get_by_payment_address(&state.pool, event.watch.chain_id, event.watch.payment_address).await?,
+        None => store::get_by_payment_address(&mut tx, event.watch.chain_id, event.watch.payment_address).await?,
     };
     let Some(deposit) = deposit else {
         tracing::warn!(payment_address = %event.watch.payment_address, chain_id = event.watch.chain_id, "indexer event for an unknown deposit");
@@ -151,6 +160,14 @@ pub async fn indexer(State(state): State<AppState>, headers: HeaderMap, body: By
 // gum-engine
 // ---------------------------------------------------------------------------------------------
 
+/// Whether an engine job id (UUIDv7, stamped with its creation time) is young enough that we may
+/// simply not have recorded it yet.
+fn job_is_recent(job_id: Uuid) -> bool {
+    let Some(created) = job_id.get_timestamp() else { return false };
+    let now = Utc::now().timestamp().max(0) as u64;
+    now.saturating_sub(created.to_unix().0) < UNKNOWN_JOB_GRACE_SECS
+}
+
 #[derive(Debug, Deserialize)]
 pub struct EngineEvent {
     pub event_id: String,
@@ -194,7 +211,15 @@ pub async fn engine(State(state): State<AppState>, headers: HeaderMap, body: Byt
         metrics::counter!("gum_inbound_webhooks_total", "source" => "engine", "outcome" => "duplicate").increment(1);
         return Ok(StatusCode::OK);
     }
-    let Some(deposit) = store::get_by_engine_job(&state.pool, event.job_id).await? else {
+    let Some(deposit) = store::get_by_engine_job(&mut tx, event.job_id).await? else {
+        if job_is_recent(event.job_id) {
+            // Returning drops the transaction, so the claim is rolled back and the engine's retry
+            // is processed once the outbox has recorded the job id.
+            tracing::warn!("engine event for a job not recorded yet; asking the engine to retry");
+            metrics::counter!("gum_inbound_webhooks_total", "source" => "engine", "outcome" => "job_not_recorded_yet")
+                .increment(1);
+            return Err(ApiError::unavailable("job_not_recorded_yet", "job not recorded yet; retry"));
+        }
         tracing::warn!("engine event for an unknown job");
         metrics::counter!("gum_inbound_webhooks_total", "source" => "engine", "outcome" => "unknown_deposit")
             .increment(1);

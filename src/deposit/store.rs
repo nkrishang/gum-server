@@ -142,24 +142,28 @@ pub async fn get(pool: &PgPool, id: Uuid) -> Result<Option<Deposit>, sqlx::Error
     sqlx::query_as(select_deposit("id = $1")).bind(id).fetch_optional(pool).await
 }
 
-pub async fn get_by_watch(pool: &PgPool, watch_id: Uuid) -> Result<Option<Deposit>, sqlx::Error> {
-    sqlx::query_as(select_deposit("watch_id = $1")).bind(watch_id).fetch_optional(pool).await
+// The lookups below take a connection, not the pool: the inbound webhook handlers call them
+// inside their open transaction. Asking the pool for a second connection while holding one
+// deadlocks once pool-size handlers run at once (2026-09-23 Monad incident).
+
+pub async fn get_by_watch(conn: &mut PgConnection, watch_id: Uuid) -> Result<Option<Deposit>, sqlx::Error> {
+    sqlx::query_as(select_deposit("watch_id = $1")).bind(watch_id).fetch_optional(conn).await
 }
 
 pub async fn get_by_payment_address(
-    pool: &PgPool,
+    conn: &mut PgConnection,
     chain_id: u64,
     address: Address,
 ) -> Result<Option<Deposit>, sqlx::Error> {
     sqlx::query_as(select_deposit("chain_id = $1 AND payment_address = $2"))
         .bind(chain_id as i64)
         .bind(hex_lower(address))
-        .fetch_optional(pool)
+        .fetch_optional(conn)
         .await
 }
 
-pub async fn get_by_engine_job(pool: &PgPool, job_id: Uuid) -> Result<Option<Deposit>, sqlx::Error> {
-    sqlx::query_as(select_deposit("engine_job_id = $1")).bind(job_id).fetch_optional(pool).await
+pub async fn get_by_engine_job(conn: &mut PgConnection, job_id: Uuid) -> Result<Option<Deposit>, sqlx::Error> {
+    sqlx::query_as(select_deposit("engine_job_id = $1")).bind(job_id).fetch_optional(conn).await
 }
 
 pub async fn events(pool: &PgPool, deposit_id: Uuid) -> Result<Vec<DepositEvent>, sqlx::Error> {
@@ -579,11 +583,34 @@ pub async fn retry_settlement(pool: &PgPool, id: Uuid) -> Result<Option<Deposit>
 }
 
 /// Deposits in `paid` that have not changed for `stale_secs`; the reconciler asks the engine.
-pub async fn stale_paid(pool: &PgPool, stale_secs: i64, limit: i64) -> Result<Vec<Deposit>, sqlx::Error> {
+/// How many deposits are `paid` (settlement pending), and how long ago the oldest was submitted.
+pub async fn paid_backlog(pool: &PgPool) -> Result<(i64, f64), sqlx::Error> {
+    sqlx::query_as(
+        "SELECT count(*), COALESCE(EXTRACT(EPOCH FROM now() - min(COALESCE(engine_submitted_at, updated_at)))::float8, 0) \
+         FROM deposits WHERE status = 'paid'",
+    )
+    .fetch_one(pool)
+    .await
+}
+
+/// `paid` deposits whose settlement was submitted more than `stale_secs` ago and that nothing has
+/// touched (webhook or poll) for `repoll_secs`, least recently touched first. Staleness counts from
+/// the submission, not from `updated_at`: a late webhook (e.g. `transaction.included` minutes after
+/// the fact) must not push the poll back by another `stale_secs`.
+pub async fn stale_paid(
+    pool: &PgPool,
+    stale_secs: i64,
+    repoll_secs: i64,
+    limit: i64,
+) -> Result<Vec<Deposit>, sqlx::Error> {
     sqlx::query_as(select_deposit(
-        "status = 'paid' AND engine_job_id IS NOT NULL AND updated_at < now() - make_interval(secs => $1) ORDER BY updated_at LIMIT $2",
+        "status = 'paid' AND engine_job_id IS NOT NULL \
+         AND COALESCE(engine_submitted_at, updated_at) < now() - make_interval(secs => $1) \
+         AND updated_at < now() - make_interval(secs => $2) \
+         ORDER BY updated_at LIMIT $3",
     ))
     .bind(stale_secs as f64)
+    .bind(repoll_secs as f64)
     .bind(limit)
     .fetch_all(pool)
     .await

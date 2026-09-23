@@ -163,6 +163,10 @@ POST /v1/admin/outbox/{id}/requeue
 - **Webhooks are acknowledged as soon as their state change commits.** Each inbound event is verified,
   deduplicated on its id *inside the same transaction* as the transition it causes, and answered `200`.
   Nothing slow happens on the sender's clock. Database trouble returns `503` so the sender retries.
+  Each handler uses exactly one database connection (its transaction), so a burst of deliveries
+  larger than the pool queues for connections instead of deadlocking. An engine event for a job
+  we have not recorded yet (the engine can report before our outbox records the job id) gets `503`
+  and is retried; an unknown job older than 10 minutes is not ours and is acknowledged.
 - **Transitions are guarded.** Every update is `WHERE status IN (…)`, so replayed, reordered or
   duplicated events are harmless, and per-(deposit, kind) outbox ordering keeps app webhooks in sequence.
 - **Idempotent everywhere.** Client idempotency keys on `POST /v1/deposit`; `Idempotency-Key` on every
@@ -175,8 +179,10 @@ POST /v1/admin/outbox/{id}/requeue
 - **A reconciler makes webhooks an optimisation, not a dependency.** Every `reconciler.interval_secs`
   it compares quiet open deposits with the indexer's watch (`GET /v1/watches/{id}`: applies a lost
   `payment.confirmed` / `threshold.reached` / `watch.expired`, re-registers a watch the indexer no longer
-  knows) and quiet `paid` deposits with the engine's job (`GET /v1/transactions/{id}`: applies a lost
-  `transaction.confirmed` / `.failed`, resubmits a job the engine no longer knows). It applies exactly
+  knows) and `paid` deposits with the engine's job (`GET /v1/transactions/{id}`: applies a lost
+  `transaction.confirmed` / `.failed`, resubmits a job the engine no longer knows). A `paid` deposit is
+  polled `reconciler.paid_stale_secs` (60 s) after its settlement was submitted — counted from the
+  submission, so late webhooks do not postpone it — and again every `paid_repoll_secs` (30 s). It applies exactly
   the guarded transitions a webhook would, so it is safe on every replica. Local expiry without the
   indexer's say-so only happens a full day after `expires_at`.
 - **Backpressure and limits.** Per-key token buckets, a body limit, a request timeout, a concurrency
@@ -189,8 +195,11 @@ Prometheus metrics: `gum_http_request_duration_seconds{route,method,status}`,
 `gum_inbound_webhooks_total{source,outcome,type}`, `gum_outbox_pending`, `gum_outbox_dead`,
 `gum_outbox_lag_seconds`, `gum_outbox_jobs_total{kind,outcome}`,
 `gum_upstream_request_duration_seconds{service,op,outcome}`, `gum_app_webhook_deliveries_total{outcome}`,
-`gum_auth_total{method,outcome}`, `gum_db_errors_total`. Alert on `gum_outbox_dead > 0`, on
-`gum_outbox_lag_seconds` p99, and on `/readyz` flipping.
+`gum_auth_total{method,outcome}`, `gum_db_errors_total`, `gum_deposits_paid`,
+`gum_deposits_paid_oldest_age_seconds`. Alert on `gum_outbox_dead > 0`, on `gum_outbox_lag_seconds`
+p99, on `/readyz` flipping, and on `gum_deposits_paid_oldest_age_seconds` above a few minutes:
+settlement takes seconds, so an old `paid` deposit means engine webhooks are not landing — which
+`/readyz` does not show.
 
 ## Configuration
 
