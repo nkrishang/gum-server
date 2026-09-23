@@ -2,6 +2,11 @@
 //! webhook. Jobs are claimed with `FOR UPDATE SKIP LOCKED`, so any number of instances can run
 //! workers; per (deposit, kind) they execute in creation order, so an app never sees
 //! `deposit.settled` before `deposit.confirmed`.
+//!
+//! Nothing here may wait without a limit: the loop waits for a whole batch before claiming the
+//! next, so one job that never returns stops every settlement (2026-09-23). Each job runs under
+//! `outbox.job_timeout_ms` and each claim under `CLAIM_TIMEOUT`, on top of the session limits
+//! every connection carries (see `db`).
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -21,6 +26,11 @@ use crate::config::Config;
 use crate::deposit::{DepositStatus, events, store};
 use crate::state::AppState;
 use crate::webhooks::sign;
+
+/// Claiming a batch is one short statement; anything longer means the connection is unhealthy.
+const CLAIM_TIMEOUT: Duration = Duration::from_secs(10);
+/// Rescheduling an abandoned job is best effort: if it fails, the job's lock expires instead.
+const RESCHEDULE_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, FromRow)]
 pub struct OutboxJob {
@@ -45,12 +55,16 @@ pub async fn run(state: AppState, shutdown: CancellationToken) {
     let cfg = state.config.outbox.clone();
     let poll = Duration::from_millis(cfg.poll_interval_ms);
     let permits = Arc::new(Semaphore::new(cfg.workers));
-    tracing::info!(workers = cfg.workers, "outbox workers started");
+    let job_timeout = Duration::from_millis(cfg.job_timeout_ms);
+    tracing::info!(workers = cfg.workers, job_timeout_ms = cfg.job_timeout_ms, "outbox workers started");
     loop {
         if shutdown.is_cancelled() {
             break;
         }
-        let jobs = match claim(&state, cfg.batch_size, cfg.lock_ttl_secs).await {
+        let claimed = tokio::time::timeout(CLAIM_TIMEOUT, claim(&state, cfg.batch_size, cfg.lock_ttl_secs))
+            .await
+            .unwrap_or_else(|_| Err(sqlx::Error::PoolTimedOut));
+        let jobs = match claimed {
             Ok(jobs) => jobs,
             Err(err) => {
                 tracing::error!(error = %err, "outbox claim failed");
@@ -68,14 +82,16 @@ pub async fn run(state: AppState, shutdown: CancellationToken) {
             let state = state.clone();
             handles.push(tokio::spawn(async move {
                 let _permit = permit;
-                execute(state, job).await;
+                run_bounded(state, job, job_timeout).await;
             }));
         }
         for h in handles {
             let _ = h.await;
         }
-        if let Err(err) = gauge(&state).await {
-            tracing::debug!(error = %err, "outbox gauge failed");
+        match tokio::time::timeout(CLAIM_TIMEOUT, gauge(&state)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => tracing::debug!(error = %err, "outbox gauge failed"),
+            Err(_) => tracing::debug!("outbox gauge timed out"),
         }
         if full_batch {
             continue;
@@ -127,6 +143,27 @@ async fn gauge(state: &AppState) -> Result<(), sqlx::Error> {
     Ok(())
 }
 
+/// Runs a job, abandoning it after `limit`. An abandoned job is rescheduled with the usual backoff;
+/// if even that cannot be written, its lock expires after `lock_ttl_secs` and it runs again.
+async fn run_bounded(state: AppState, job: OutboxJob, limit: Duration) {
+    if tokio::time::timeout(limit, execute(state.clone(), job.clone())).await.is_ok() {
+        return;
+    }
+    tracing::error!(
+        job_id = %job.id, kind = %job.kind, deposit_id = %job.deposit_id, attempt = job.attempts,
+        timeout_ms = limit.as_millis() as u64, "outbox job timed out; abandoned and rescheduled"
+    );
+    metrics::counter!("gum_outbox_jobs_total", "kind" => job.kind.clone(), "outcome" => "timeout").increment(1);
+    let error = format!("timed out after {} ms", limit.as_millis());
+    match tokio::time::timeout(RESCHEDULE_TIMEOUT, retry_later(&state, &job, error)).await {
+        Ok(Ok(())) => {}
+        Ok(Err(err)) => {
+            tracing::warn!(job_id = %job.id, error = %err, "could not reschedule the abandoned job; its lock will expire")
+        }
+        Err(_) => tracing::warn!(job_id = %job.id, "rescheduling the abandoned job timed out; its lock will expire"),
+    }
+}
+
 async fn execute(state: AppState, job: OutboxJob) {
     let span = tracing::info_span!("outbox_job", job_id = %job.id, kind = %job.kind, deposit_id = %job.deposit_id, attempt = job.attempts);
     let _guard = span.enter();
@@ -154,27 +191,7 @@ async fn execute(state: AppState, job: OutboxJob) {
         Attempt::Done => {
             sqlx::query("DELETE FROM outbox WHERE id = $1").bind(job.id).execute(&state.pool).await.map(|_| ())
         }
-        Attempt::Retry(error) => {
-            let age = (Utc::now() - job.created_at).num_seconds();
-            match schedule(&state.config, &job.kind, job.attempts, age, rand::random::<f64>()) {
-                Schedule::Dead => {
-                    tracing::error!(error, age_secs = age, "outbox job exhausted its retry window");
-                    mark_dead(&state, job.id, &error).await
-                }
-                Schedule::Retry(delay) => {
-                    tracing::warn!(error, retry_in_ms = delay.as_millis() as u64, "outbox job failed; will retry");
-                    sqlx::query(
-                        "UPDATE outbox SET next_attempt_at = now() + make_interval(secs => $2), locked_until = NULL, last_error = $3 WHERE id = $1",
-                    )
-                    .bind(job.id)
-                    .bind(delay.as_secs_f64())
-                    .bind(error)
-                    .execute(&state.pool)
-                    .await
-                    .map(|_| ())
-                }
-            }
-        }
+        Attempt::Retry(error) => retry_later(&state, &job, error).await,
         Attempt::Dead(error) => {
             tracing::error!(error, "outbox job dead");
             mark_dead(&state, job.id, &error).await
@@ -183,6 +200,29 @@ async fn execute(state: AppState, job: OutboxJob) {
     if let Err(err) = result {
         tracing::error!(error = %err, "failed to finalise outbox job; the lock will expire and it will run again");
         metrics::counter!("gum_db_errors_total", "kind" => "outbox_finalise").increment(1);
+    }
+}
+
+/// Schedules the job's next attempt per `schedule`, or marks it dead when its retry window is over.
+async fn retry_later(state: &AppState, job: &OutboxJob, error: String) -> Result<(), sqlx::Error> {
+    let age = (Utc::now() - job.created_at).num_seconds();
+    match schedule(&state.config, &job.kind, job.attempts, age, rand::random::<f64>()) {
+        Schedule::Dead => {
+            tracing::error!(error, age_secs = age, "outbox job exhausted its retry window");
+            mark_dead(state, job.id, &error).await
+        }
+        Schedule::Retry(delay) => {
+            tracing::warn!(error, retry_in_ms = delay.as_millis() as u64, "outbox job failed; will retry");
+            sqlx::query(
+                "UPDATE outbox SET next_attempt_at = now() + make_interval(secs => $2), locked_until = NULL, last_error = $3 WHERE id = $1",
+            )
+            .bind(job.id)
+            .bind(delay.as_secs_f64())
+            .bind(error)
+            .execute(&state.pool)
+            .await
+            .map(|_| ())
+        }
     }
 }
 

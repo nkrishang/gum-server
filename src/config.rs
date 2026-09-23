@@ -49,6 +49,13 @@ pub struct DatabaseConfig {
     pub min_connections: u32,
     pub acquire_timeout_ms: u64,
     pub auto_migrate: bool,
+    /// Session limits on every pooled connection (0 disables one). See `db`.
+    #[serde(default = "default_statement_timeout_ms")]
+    pub statement_timeout_ms: u64,
+    #[serde(default = "default_lock_timeout_ms")]
+    pub lock_timeout_ms: u64,
+    #[serde(default = "default_idle_in_transaction_timeout_ms")]
+    pub idle_in_transaction_timeout_ms: u64,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -106,6 +113,10 @@ pub struct OutboxConfig {
     pub lock_ttl_secs: i64,
     /// Backoff cap for jobs towards gum-indexer / gum-engine. These never give up.
     pub upstream_retry_cap_ms: u64,
+    /// Longest a single job may run before it is abandoned and retried. Below `lock_ttl_secs`, so
+    /// an abandoned job is never still running when another worker picks it up.
+    #[serde(default = "default_job_timeout_ms")]
+    pub job_timeout_ms: u64,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -188,6 +199,11 @@ impl Config {
         if self.outbox.workers == 0 {
             bail!("outbox.workers must be at least 1");
         }
+        if self.outbox.job_timeout_ms == 0
+            || self.outbox.job_timeout_ms >= self.outbox.lock_ttl_secs.max(0) as u64 * 1000
+        {
+            bail!("outbox.job_timeout_ms must be above 0 and below outbox.lock_ttl_secs");
+        }
         Ok(())
     }
 
@@ -239,4 +255,20 @@ fn parse_nonzero_address(raw: &str) -> anyhow::Result<Address> {
 
 fn default_paid_repoll_secs() -> i64 {
     30
+}
+
+fn default_statement_timeout_ms() -> u64 {
+    30_000
+}
+
+fn default_lock_timeout_ms() -> u64 {
+    5_000
+}
+
+fn default_idle_in_transaction_timeout_ms() -> u64 {
+    60_000
+}
+
+fn default_job_timeout_ms() -> u64 {
+    30_000
 }

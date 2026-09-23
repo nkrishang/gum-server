@@ -29,6 +29,10 @@ use crate::webhooks::inbound::{SettlementOutcome, apply_settlement, resubmit};
 /// that was actually paid is not. So only deposits a full day past expiry are expired blind.
 const EXPIRY_GRACE_SECS: i64 = 86_400;
 const BATCH: i64 = 100;
+/// A due outbox job this old means the outbox is not draining. It normally runs within seconds.
+pub const OUTBOX_STALL_SECS: f64 = 120.0;
+/// A tick that takes longer than this is abandoned; the next one starts over.
+const TICK_TIMEOUT: Duration = Duration::from_secs(300);
 
 pub async fn run(state: AppState, shutdown: CancellationToken) {
     let interval = Duration::from_secs(state.config.reconciler.interval_secs.max(5));
@@ -38,11 +42,15 @@ pub async fn run(state: AppState, shutdown: CancellationToken) {
             _ = tokio::time::sleep(interval) => {}
             _ = shutdown.cancelled() => break,
         }
-        match tick(&state).await {
-            Ok(()) => metrics::counter!("gum_reconciler_ticks_total", "outcome" => "ok").increment(1),
-            Err(err) => {
+        match tokio::time::timeout(TICK_TIMEOUT, tick(&state)).await {
+            Ok(Ok(())) => metrics::counter!("gum_reconciler_ticks_total", "outcome" => "ok").increment(1),
+            Ok(Err(err)) => {
                 tracing::error!(error = %err, "reconciler tick failed");
                 metrics::counter!("gum_reconciler_ticks_total", "outcome" => "error").increment(1);
+            }
+            Err(_) => {
+                tracing::error!(timeout_secs = TICK_TIMEOUT.as_secs(), "reconciler tick timed out");
+                metrics::counter!("gum_reconciler_ticks_total", "outcome" => "timeout").increment(1);
             }
         }
     }
@@ -51,6 +59,7 @@ pub async fn run(state: AppState, shutdown: CancellationToken) {
 
 /// One pass. Public so tests can drive it without waiting for the interval.
 pub async fn tick(state: &AppState) -> anyhow::Result<()> {
+    check_outbox(state).await?;
     let expired = store::expire_overdue(&state.pool, EXPIRY_GRACE_SECS, 500).await?;
     if expired > 0 {
         tracing::warn!(expired, "expired overdue deposits without an indexer notice");
@@ -63,6 +72,19 @@ pub async fn tick(state: &AppState) -> anyhow::Result<()> {
         reconcile_paid(state).await?;
     }
     store::prune(&state.pool, state.config.reconciler.idempotency_ttl_secs).await?;
+    Ok(())
+}
+
+/// Watches the outbox from outside it. The outbox cannot report its own stall (on 2026-09-23 it
+/// hung for over ten minutes and logged nothing), so every tick measures how long the oldest due
+/// job has been waiting. Alert on `gum_outbox_oldest_due_age_seconds`.
+async fn check_outbox(state: &AppState) -> anyhow::Result<()> {
+    let (due, oldest_secs) = store::outbox_due(&state.pool).await?;
+    metrics::gauge!("gum_outbox_due").set(due as f64);
+    metrics::gauge!("gum_outbox_oldest_due_age_seconds").set(oldest_secs);
+    if oldest_secs > OUTBOX_STALL_SECS {
+        tracing::error!(due, oldest_due_age_secs = oldest_secs as u64, "outbox is not draining");
+    }
     Ok(())
 }
 

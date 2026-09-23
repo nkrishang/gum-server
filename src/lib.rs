@@ -17,6 +17,7 @@ pub mod auth;
 pub mod chain;
 pub mod clients;
 pub mod config;
+pub mod db;
 pub mod deposit;
 pub mod error;
 pub mod outbox;

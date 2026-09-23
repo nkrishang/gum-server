@@ -13,7 +13,7 @@ use chrono::Utc;
 use gum_server::config::{ChainConfig, Config, TokenConfig};
 use gum_server::state::AppState;
 use gum_server::webhooks::sign;
-use gum_server::{MIGRATOR, app, outbox, reconciler};
+use gum_server::{app, outbox, reconciler};
 use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
 use serde::Serialize;
 use sqlx::PgPool;
@@ -75,14 +75,17 @@ impl Harness {
     /// Like `start`, with the server's connection pool built from `pool_options` (to test behaviour
     /// when the pool is small or contended).
     pub async fn start_with_pool(pool_options: PgPoolOptions) -> Option<Self> {
+        Self::start_with(pool_options, |_| {}).await
+    }
+
+    /// Like `start_with_pool`, and `tweak` adjusts the configuration before anything starts.
+    pub async fn start_with(pool_options: PgPoolOptions, tweak: impl FnOnce(&mut Config)) -> Option<Self> {
         let admin_url = test_database_url()?;
         let _ = tracing_subscriber::fmt()
             .with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "warn".into()))
             .with_test_writer()
             .try_init();
         let db_url = fresh_database(&admin_url).await;
-        let pool = pool_options.connect(&db_url).await.expect("db");
-        MIGRATOR.run(&pool).await.expect("migrations");
 
         let indexer = MockServer::start().await;
         let engine = MockServer::start().await;
@@ -121,7 +124,14 @@ impl Harness {
             },
         )]);
 
+        tweak(&mut config);
         config.validate().expect("test config is valid");
+        gum_server::db::migrate(&config.database).await.expect("migrations");
+        // Built like the service's own pool: same session limits on every connection.
+        let pool = pool_options
+            .connect_with(gum_server::db::connect_options(&config.database).expect("connect options"))
+            .await
+            .expect("db");
         let state = AppState::new(config, pool.clone(), metrics).expect("state");
         let shutdown = CancellationToken::new();
         tokio::spawn(outbox::run(state.clone(), shutdown.clone()));
