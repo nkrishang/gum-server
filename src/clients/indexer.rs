@@ -26,6 +26,9 @@ pub struct CreateWatch<'a> {
     pub balance_threshold: String,
     pub webhook_endpoint: &'a str,
     pub expires_at: DateTime<Utc>,
+    /// When the address was handed out. Payments can arrive before the watch is registered (the
+    /// outbox may lag), and gum-indexer scans back to here so none is missed.
+    pub payments_since: DateTime<Utc>,
 }
 
 #[derive(Debug, Deserialize)]
