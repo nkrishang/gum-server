@@ -691,9 +691,18 @@ async fn settlement_failure_expiry_and_operator_retry() {
     let retried: Value = res.json().await.unwrap();
     assert!(retried.get("failure").is_none(), "a retried deposit carries no stale failure: {retried}");
     assert_eq!(h.deposit_status(id).await, "paid");
+    // Wait for the job id to be recorded, not just for the engine mock to receive the request:
+    // `submit_execute` marks the deposit only after the engine's 202, and the transient-failure
+    // event below is matched by job id. Delivered before that commit, it would be an unknown job
+    // (this fixture's job id is too old for the not-recorded-yet 503) and be dropped, so the
+    // third submission would never be queued.
     h.wait_for("second engine submission", Duration::from_secs(5), || async {
-        let reqs = h.engine.received_requests().await.unwrap();
-        (reqs.len() == 2).then_some(())
+        sqlx::query_as::<_, (Option<Uuid>,)>("SELECT engine_job_id FROM deposits WHERE id = $1")
+            .bind(id)
+            .fetch_one(&h.pool)
+            .await
+            .unwrap()
+            .0
     })
     .await;
     let reqs = h.engine.received_requests().await.unwrap();
