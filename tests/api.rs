@@ -9,6 +9,7 @@ use alloy_primitives::{Address, B256, U256};
 use chrono::Utc;
 use common::{ADMIN_TOKEN, ENGINE_SECRET, FACTORY, Harness, INDEXER_SECRET, USDC, deposit_body};
 use gum_server::chain::payment::{Call, PaymentTerms};
+use gum_server::chain::revert::{CallRef, RevertKind, RevertView};
 use gum_server::webhooks::sign;
 use serde_json::{Value, json};
 use uuid::Uuid;
@@ -646,10 +647,24 @@ async fn settlement_failure_expiry_and_operator_retry() {
         "settlement call 0 (transfer of 2500000 to 0x70997970c51812dc3a010c7d01b50e0d17dc79c8) reverted: \
          Blacklistable: account is blacklisted"
     );
-    assert_eq!(failure["revert"]["name"], "CallFailed");
-    assert_eq!(failure["revert"]["call"], json!({ "index": 0, "target": USDC.to_ascii_lowercase() }));
-    assert_eq!(failure["revert"]["args"]["reason"]["args"]["message"], "Blacklistable: account is blacklisted");
-    assert_eq!(failure["revert"]["data"], BLACKLISTED);
+    // Typed, as a client would read it: the call's own revert and its raw bytes are one hop away.
+    let revert: RevertView = serde_json::from_value(failure["revert"].clone()).unwrap();
+    assert_eq!(revert.kind, RevertKind::Decoded);
+    assert_eq!(revert.name.as_deref(), Some("CallFailed"));
+    assert_eq!(revert.data, BLACKLISTED);
+    assert_eq!(revert.call, Some(CallRef { index: 0, target: USDC.to_ascii_lowercase() }));
+    let reason = revert.reason.unwrap();
+    assert_eq!(reason.signature.as_deref(), Some("Error(string)"));
+    assert_eq!(reason.args.unwrap()["message"], "Blacklistable: account is blacklisted");
+    assert_eq!(
+        reason.data,
+        format!(
+            "0x{}",
+            hex::encode(alloy_sol_types::SolError::abi_encode(&alloy_sol_types::Revert::from(
+                "Blacklistable: account is blacklisted"
+            )))
+        )
+    );
     // The engine's own words stay on the timeline.
     assert_eq!(
         failed["data"]["engine_message"],
@@ -1358,14 +1373,17 @@ async fn the_reconciler_explains_failed_settlements_too() {
             "code": "engine_simulation_reverted",
             "message": "the payment address holds 1000000, less than the 2500000 it settles",
             "revert": {
-                "name": "InsufficientTokenBalance",
-                "args": { "balance": "1000000", "required": "2500000" },
+                "kind": "decoded",
                 "data": UNDERFUNDED,
+                "selector": "0xa17124f8",
+                "name": "InsufficientTokenBalance",
+                "signature": "InsufficientTokenBalance(uint256,uint256)",
+                "args": { "balance": "1000000", "required": "2500000" },
             }
         })
     );
     let last = view["events"].as_array().unwrap().last().unwrap().clone();
     assert_eq!(last["type"], "deposit.failed");
     assert_eq!(last["data"]["source"], "reconciler");
-    assert_eq!(last["data"]["revert_data"], UNDERFUNDED);
+    assert_eq!(last["data"]["revert"], view["failure"]["revert"]);
 }

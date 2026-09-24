@@ -114,26 +114,44 @@ Lists are newest first with keyset pagination: pass `next_cursor` back as `curso
 #### Why a settlement failed
 
 `failure` is `{ "code", "message" }`, plus `revert` when the chain said why. `PaymentFactory.execute`
-passes on the `Payment` constructor's revert data, which wraps a failing settlement call's own reason,
-and gum-engine reports those bytes when its simulation of `execute` reverts. gum-server decodes them
-([`src/chain/revert.rs`](src/chain/revert.rs)) into a readable `message` and a structured `revert`:
+passes on the `Payment` constructor's revert data, which wraps a failing settlement call's own revert
+data, and gum-engine reports those bytes when its simulation of `execute` reverts. gum-server decodes
+them ([`src/chain/revert.rs`](src/chain/revert.rs)) into a readable `message` and a typed `revert`.
+Every level of `revert` carries its raw bytes, so an app can always decode them itself, e.g. against
+its own contracts' ABIs:
+
+```ts
+type Revert = {
+  kind: "decoded" | "empty" | "unrecognised";
+  data: string;                   // this level's raw revert data, 0x hex ("0x" when empty)
+  selector?: string;              // first 4 bytes of data, when there are at least 4
+  name?: string;                  // decoded: "CallFailed", "Error", "ERC20InsufficientBalance", …
+  signature?: string;             // decoded: "CallFailed(uint256,bytes)"
+  args?: Record<string, string>;  // decoded: uints in decimal, addresses as lowercase 0x hex, strings as-is
+  call?: { index: number; target: string };  // CallFailed / CallTargetHasNoCode: the deposit's call
+  reason?: Revert;                // CallFailed: the call's own revert (its revertData), same shape
+};
+```
 
 ```json
 "failure": {
   "code": "engine_simulation_reverted",
   "message": "settlement call 0 (transfer of 2500000 to 0x7099…) reverted: Blacklistable: account is blacklisted",
   "revert": {
-    "name": "CallFailed",
-    "args": { "index": 0, "reason": { "name": "Error", "args": { "message": "Blacklistable: account is blacklisted" } } },
+    "kind": "decoded", "data": "0x5c0dee5d…", "selector": "0x5c0dee5d",
+    "name": "CallFailed", "signature": "CallFailed(uint256,bytes)", "args": { "index": "0" },
     "call": { "index": 0, "target": "0x…token" },
-    "data": "0x5c0dee5d…"
+    "reason": {
+      "kind": "decoded", "data": "0x08c379a0…", "selector": "0x08c379a0",
+      "name": "Error", "signature": "Error(string)", "args": { "message": "Blacklistable: account is blacklisted" }
+    }
   }
 }
 ```
 
 | `revert.name` | Meaning |
 |---|---|
-| `CallFailed` | Settlement call `args.index` reverted; `args.reason` is the target's own revert, decoded the same way. |
+| `CallFailed` | Settlement call `args.index` reverted; `reason` is the target's own revert. |
 | `InsufficientTokenBalance` | The address holds `args.balance`, less than the `args.required` it settles. |
 | `AmountNotSpent` | The calls succeeded but left `args.remaining` unspent (e.g. a token that returns `false`). |
 | `CallTargetHasNoCode` | A call targets an address with no code on this chain. |
@@ -142,12 +160,14 @@ and gum-engine reports those bytes when its simulation of `execute` reverts. gum
 | `TransferFailed` | `Payment`'s own transfer of the excess or an expired balance to recovery failed. |
 | `Error` / `Panic` | Solidity's `require`/`revert` string (`args.message`) or panic (`args.code`). |
 | a token's custom error | e.g. `ERC20InsufficientBalance`, `EnforcedPause`, `AccountIsFrozen`, with named `args`. |
-| `null` | Empty revert data, or an error we do not know (`selector` is set). `data` is always the raw bytes. |
 
-`code` is unchanged: `engine_simulation_reverted` when the simulation reverted, `engine_<code>` for
-the engine's other failures, `expired_on_chain` / `wrong_chain` / `unexpected_outcome` from a receipt.
-A transaction that reverts once mined carries no revert data (the engine does not trace it), so only
-simulation failures have `revert`. The engine's own message is kept on the event as `engine_message`.
+`kind: "unrecognised"` is an error we do not know (or a truncated one: `Payment` caps a call's revert
+data at 65,535 bytes); decode `data` yourself. `code` is unchanged: `engine_simulation_reverted` when
+the simulation reverted, `engine_<code>` for the engine's other failures, `expired_on_chain` /
+`wrong_chain` / `unexpected_outcome` from a receipt. A transaction that reverts once mined carries no
+revert data (the engine does not trace it), so only simulation failures have `revert`. The
+`deposit.failed` event keeps the engine's own message as `data.engine_message`, and the same
+`data.revert`.
 
 ### App webhooks
 

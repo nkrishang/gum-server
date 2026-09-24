@@ -12,7 +12,7 @@ use sqlx::types::Json;
 use uuid::Uuid;
 
 use crate::chain::payment::{Call, PaymentTerms};
-use crate::chain::revert;
+use crate::chain::revert::RevertView;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type)]
 #[sqlx(type_name = "deposit_status", rename_all = "snake_case")]
@@ -146,10 +146,9 @@ impl Deposit {
             failure: self.failure_code.as_ref().map(|code| Failure {
                 code: code.clone(),
                 message: self.failure_message.clone().unwrap_or_default(),
-                revert: self
-                    .failure_revert_data
-                    .as_deref()
-                    .map(|d| revert::view(&d.parse().expect("stored revert data is valid"), &self.calls())),
+                revert: self.failure_revert_data.as_deref().map(|d| {
+                    RevertView::of_execute(&d.parse::<Bytes>().expect("stored revert data is valid"), &self.calls())
+                }),
             }),
             timestamps: Timestamps {
                 created_at: self.created_at,
@@ -224,9 +223,9 @@ impl From<&Call> for CallView {
 pub struct Failure {
     pub code: String,
     pub message: String,
-    /// Why `PaymentFactory.execute` reverted, decoded from its revert data (see `chain::revert`).
+    /// Why `PaymentFactory.execute` reverted, decoded from its revert data, with the raw bytes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub revert: Option<serde_json::Value>,
+    pub revert: Option<RevertView>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

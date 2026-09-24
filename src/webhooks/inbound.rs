@@ -25,7 +25,7 @@ use uuid::Uuid;
 
 use super::sign;
 use crate::chain::payment::{self, ExecutionOutcome, ReceiptLog};
-use crate::chain::revert;
+use crate::chain::revert::{self, RevertView};
 use crate::clients::engine::EngineError;
 use crate::deposit::{Deposit, store};
 use crate::error::ApiError;
@@ -366,11 +366,10 @@ impl SettlementOutcome {
         let engine_message = error.map(|e| e.message.as_str()).filter(|m| !m.is_empty()).unwrap_or(default_message);
         let revert_data = error.and_then(EngineError::revert_bytes);
         data["engine_message"] = json!(engine_message);
-        data["revert_data"] = json!(revert_data.as_ref().map(ToString::to_string));
         let message = match &revert_data {
             Some(bytes) => {
                 let calls = deposit.calls();
-                data["revert"] = revert::view(bytes, &calls);
+                data["revert"] = json!(RevertView::of_execute(bytes, &calls));
                 revert::decode_execute(bytes).describe(&calls)
             }
             None => engine_message.to_owned(),

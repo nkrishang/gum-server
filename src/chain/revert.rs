@@ -12,11 +12,16 @@
 //! Decoding is best effort. `Payment`'s and `PaymentFactory`'s errors are known exactly; a call
 //! target's reason is decoded when it is a Solidity `Error(string)` or `Panic(uint256)`, or one of
 //! the custom errors below that the registry's tokens are known to use. Anything else is kept as
-//! an unrecognised error with its selector, and the raw bytes are always kept alongside.
+//! an unrecognised error with its selector.
+//!
+//! Apps get [`RevertView`]: every level, the call's own reason included, carries its raw bytes, so
+//! an app can always decode them against ABIs we do not know.
+
+use std::collections::BTreeMap;
 
 use alloy_primitives::{Address, Bytes, U256};
 use alloy_sol_types::{SolCall, SolError, SolInterface, sol};
-use serde_json::{Map, Value, json};
+use serde::{Deserialize, Serialize};
 
 use super::payment::{Call, IERC20};
 
@@ -66,8 +71,9 @@ sol! {
 pub enum Reason {
     /// `Payment`: the address holds less than the amount it settles.
     InsufficientTokenBalance { balance: U256, required: U256 },
-    /// `Payment`: settlement call `index` reverted with `reason`, the target's own revert.
-    CallFailed { index: U256, reason: Box<Reason> },
+    /// `Payment`: settlement call `index` reverted with `revert_data`, the target's own revert,
+    /// decoded as `reason`.
+    CallFailed { index: U256, revert_data: Bytes, reason: Box<Reason> },
     /// `Payment`: settlement call `index` targets an address with no code.
     CallTargetHasNoCode { index: U256, target: Address },
     /// `Payment`: the calls succeeded but left `remaining` of the amount unspent.
@@ -80,8 +86,8 @@ pub enum Reason {
     Message(String),
     /// `Panic(uint256)`: a failed assert, arithmetic overflow, out-of-bounds index, …
     Panic(U256),
-    /// One of [`ICallTargetErrors`], with its arguments.
-    Custom { name: &'static str, args: Vec<(&'static str, Value)> },
+    /// One of [`ICallTargetErrors`], with its arguments as [`RevertView::args`] renders them.
+    Custom { signature: &'static str, args: Vec<(&'static str, String)> },
     /// Reverted without data.
     Empty,
     /// Data we cannot decode: an error we do not know, or a truncated one.
@@ -96,7 +102,11 @@ pub fn decode_execute(data: &[u8]) -> Reason {
             E::InsufficientTokenBalance(e) => {
                 Reason::InsufficientTokenBalance { balance: e.balance, required: e.required }
             }
-            E::CallFailed(e) => Reason::CallFailed { index: e.index, reason: Box::new(decode_call(&e.revertData)) },
+            E::CallFailed(e) => Reason::CallFailed {
+                index: e.index,
+                reason: Box::new(decode_call(&e.revertData)),
+                revert_data: e.revertData,
+            },
             E::CallTargetHasNoCode(e) => Reason::CallTargetHasNoCode { index: e.index, target: e.target },
             E::AmountNotSpent(e) => Reason::AmountNotSpent { remaining: e.remaining },
         };
@@ -125,49 +135,77 @@ pub fn decode_call(data: &[u8]) -> Reason {
     let Ok(error) = ICallTargetErrors::ICallTargetErrorsErrors::abi_decode(data) else {
         return Reason::Unrecognised(Bytes::copy_from_slice(data));
     };
-    use ICallTargetErrors::ICallTargetErrorsErrors as E;
-    let address = |a: Address| json!(format!("{a:#x}"));
-    let amount = |v: U256| json!(v.to_string());
-    let (name, args) = match error {
-        E::ERC20InsufficientBalance(e) => (
-            "ERC20InsufficientBalance",
-            vec![("sender", address(e.sender)), ("balance", amount(e.balance)), ("needed", amount(e.needed))],
-        ),
-        E::ERC20InvalidSender(e) => ("ERC20InvalidSender", vec![("sender", address(e.sender))]),
-        E::ERC20InvalidReceiver(e) => ("ERC20InvalidReceiver", vec![("receiver", address(e.receiver))]),
-        E::ERC20InsufficientAllowance(e) => (
-            "ERC20InsufficientAllowance",
-            vec![("spender", address(e.spender)), ("allowance", amount(e.allowance)), ("needed", amount(e.needed))],
-        ),
-        E::ERC20InvalidApprover(e) => ("ERC20InvalidApprover", vec![("approver", address(e.approver))]),
-        E::ERC20InvalidSpender(e) => ("ERC20InvalidSpender", vec![("spender", address(e.spender))]),
-        E::EnforcedPause(_) => ("EnforcedPause", vec![]),
-        E::AccountIsFrozen(e) => ("AccountIsFrozen", vec![("frozenAccount", address(e.frozenAccount))]),
-        E::TransferPaused(_) => ("TransferPaused", vec![]),
-        E::InsufficientBalance(_) => ("InsufficientBalance", vec![]),
-        E::InsufficientAllowance(_) => ("InsufficientAllowance", vec![]),
-        E::TransferFailed(_) => ("TransferFailed", vec![]),
-        E::TransferFromFailed(_) => ("TransferFromFailed", vec![]),
-        E::ApproveFailed(_) => ("ApproveFailed", vec![]),
-    };
-    Reason::Custom { name, args }
+    use ICallTargetErrors::{ICallTargetErrorsErrors as E, *};
+    fn custom<T: SolError>(args: Vec<(&'static str, String)>) -> Reason {
+        Reason::Custom { signature: T::SIGNATURE, args }
+    }
+    match error {
+        E::ERC20InsufficientBalance(e) => custom::<ERC20InsufficientBalance>(vec![
+            ("sender", address(e.sender)),
+            ("balance", e.balance.to_string()),
+            ("needed", e.needed.to_string()),
+        ]),
+        E::ERC20InvalidSender(e) => custom::<ERC20InvalidSender>(vec![("sender", address(e.sender))]),
+        E::ERC20InvalidReceiver(e) => custom::<ERC20InvalidReceiver>(vec![("receiver", address(e.receiver))]),
+        E::ERC20InsufficientAllowance(e) => custom::<ERC20InsufficientAllowance>(vec![
+            ("spender", address(e.spender)),
+            ("allowance", e.allowance.to_string()),
+            ("needed", e.needed.to_string()),
+        ]),
+        E::ERC20InvalidApprover(e) => custom::<ERC20InvalidApprover>(vec![("approver", address(e.approver))]),
+        E::ERC20InvalidSpender(e) => custom::<ERC20InvalidSpender>(vec![("spender", address(e.spender))]),
+        E::EnforcedPause(_) => custom::<EnforcedPause>(vec![]),
+        E::AccountIsFrozen(e) => custom::<AccountIsFrozen>(vec![("frozenAccount", address(e.frozenAccount))]),
+        E::TransferPaused(_) => custom::<TransferPaused>(vec![]),
+        E::InsufficientBalance(_) => custom::<InsufficientBalance>(vec![]),
+        E::InsufficientAllowance(_) => custom::<InsufficientAllowance>(vec![]),
+        E::TransferFailed(_) => custom::<TransferFailed>(vec![]),
+        E::TransferFromFailed(_) => custom::<TransferFromFailed>(vec![]),
+        E::ApproveFailed(_) => custom::<ApproveFailed>(vec![]),
+    }
 }
 
 impl Reason {
-    /// The Solidity error's name; `None` when there is no error to name (empty or unrecognised).
-    pub fn name(&self) -> Option<&'static str> {
+    /// The Solidity error's signature, e.g. `CallFailed(uint256,bytes)`; `None` when there is no
+    /// error to name (empty or unrecognised).
+    pub fn signature(&self) -> Option<&'static str> {
         Some(match self {
-            Self::InsufficientTokenBalance { .. } => "InsufficientTokenBalance",
-            Self::CallFailed { .. } => "CallFailed",
-            Self::CallTargetHasNoCode { .. } => "CallTargetHasNoCode",
-            Self::AmountNotSpent { .. } => "AmountNotSpent",
-            Self::AlreadyDeployed => "AlreadyDeployed",
-            Self::DeploymentFailed => "DeploymentFailed",
-            Self::Message(_) => "Error",
-            Self::Panic(_) => "Panic",
-            Self::Custom { name, .. } => name,
+            Self::InsufficientTokenBalance { .. } => IPaymentErrors::InsufficientTokenBalance::SIGNATURE,
+            Self::CallFailed { .. } => IPaymentErrors::CallFailed::SIGNATURE,
+            Self::CallTargetHasNoCode { .. } => IPaymentErrors::CallTargetHasNoCode::SIGNATURE,
+            Self::AmountNotSpent { .. } => IPaymentErrors::AmountNotSpent::SIGNATURE,
+            Self::AlreadyDeployed => IPaymentFactoryErrors::AlreadyDeployed::SIGNATURE,
+            Self::DeploymentFailed => IPaymentFactoryErrors::DeploymentFailed::SIGNATURE,
+            Self::Message(_) => alloy_sol_types::Revert::SIGNATURE,
+            Self::Panic(_) => alloy_sol_types::Panic::SIGNATURE,
+            Self::Custom { signature, .. } => signature,
             Self::Empty | Self::Unrecognised(_) => return None,
         })
+    }
+
+    /// The Solidity error's name, e.g. `CallFailed`.
+    pub fn name(&self) -> Option<&'static str> {
+        self.signature().map(|s| s.split('(').next().expect("split yields at least one item"))
+    }
+
+    /// The error's arguments, every value a string: `uint`s in decimal, addresses as lowercase
+    /// `0x` hex, strings as they are. `CallFailed`'s `revertData` is not among them: it is the
+    /// nested reason.
+    fn args(&self) -> Vec<(&'static str, String)> {
+        match self {
+            Self::InsufficientTokenBalance { balance, required } => {
+                vec![("balance", balance.to_string()), ("required", required.to_string())]
+            }
+            Self::CallFailed { index, .. } => vec![("index", index.to_string())],
+            Self::CallTargetHasNoCode { index, target } => {
+                vec![("index", index.to_string()), ("target", address(*target))]
+            }
+            Self::AmountNotSpent { remaining } => vec![("remaining", remaining.to_string())],
+            Self::Message(message) => vec![("message", message.clone())],
+            Self::Panic(code) => vec![("code", code.to_string())],
+            Self::Custom { args, .. } => args.clone(),
+            Self::AlreadyDeployed | Self::DeploymentFailed | Self::Empty | Self::Unrecognised(_) => vec![],
+        }
     }
 
     /// A bounded label for metrics: the error's name, `empty` or `unrecognised`, and for
@@ -191,7 +229,7 @@ impl Reason {
             Self::InsufficientTokenBalance { balance, required } => {
                 format!("the payment address holds {balance}, less than the {required} it settles")
             }
-            Self::CallFailed { index, reason } => {
+            Self::CallFailed { index, reason, .. } => {
                 format!("settlement {} reverted: {}", describe_call(*index, calls), reason.describe_call_reason())
             }
             Self::CallTargetHasNoCode { index, target } => {
@@ -205,7 +243,7 @@ impl Reason {
                  receipt says whether it settled or went to recovery"
                 .to_owned(),
             Self::DeploymentFailed => "the Payment constructor reverted without data (e.g. out of gas)".to_owned(),
-            Self::Custom { name: "TransferFailed", .. } => {
+            Self::Custom { signature, .. } if *signature == ICallTargetErrors::TransferFailed::SIGNATURE => {
                 "the payment's own transfer of the token to the recovery address failed".to_owned()
             }
             other => format!("reverted: {}", other.describe_call_reason()),
@@ -220,9 +258,9 @@ impl Reason {
                 Some(kind) => format!("panic {code:#x} ({kind})"),
                 None => format!("panic {code:#x}"),
             },
-            Self::Custom { name, args } => {
-                let args: Vec<String> = args.iter().map(|(k, v)| format!("{k}: {}", plain(v))).collect();
-                format!("{name}({})", args.join(", "))
+            Self::Custom { .. } => {
+                let args: Vec<String> = self.args().iter().map(|(k, v)| format!("{k}: {v}")).collect();
+                format!("{}({})", self.name().expect("named"), args.join(", "))
             }
             Self::Empty => "no reason given".to_owned(),
             Self::Unrecognised(data) if data.len() >= 4 => {
@@ -233,57 +271,101 @@ impl Reason {
             other => other.describe(&[]),
         }
     }
+}
 
-    /// The structured form served as `failure.revert`:
-    /// `{"name": "CallFailed", "args": {"index": 0, "reason": {…}}, "call": {"index": 0, "target": "0x…"}}`.
-    /// `name` is null for an empty or unrecognised revert; an unrecognised one carries `selector`.
-    pub fn to_json(&self, calls: &[Call]) -> Value {
-        let mut out = Map::new();
-        out.insert("name".into(), json!(self.name()));
-        let args: Vec<(&str, Value)> = match self {
-            Self::InsufficientTokenBalance { balance, required } => {
-                vec![("balance", json!(balance.to_string())), ("required", json!(required.to_string()))]
-            }
-            Self::CallFailed { index, reason } => vec![("index", index_json(*index)), ("reason", reason.to_json(&[]))],
-            Self::CallTargetHasNoCode { index, target } => {
-                vec![("index", index_json(*index)), ("target", json!(format!("{target:#x}")))]
-            }
-            Self::AmountNotSpent { remaining } => vec![("remaining", json!(remaining.to_string()))],
-            Self::Message(message) => vec![("message", json!(message))],
-            Self::Panic(code) => vec![("code", json!(format!("{code:#x}")))],
-            Self::Custom { args, .. } => args.clone(),
-            Self::Unrecognised(data) if data.len() >= 4 => {
-                out.insert("selector".into(), json!(format!("0x{}", hex::encode(&data[..4]))));
-                vec![]
-            }
-            _ => vec![],
+/// How far a revert could be decoded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RevertKind {
+    /// A known error: `name`, `signature` and `args` are set.
+    Decoded,
+    /// No revert data at all.
+    Empty,
+    /// Data we cannot decode: `selector` is set when there are at least four bytes.
+    Unrecognised,
+}
+
+/// `failure.revert`: one level of revert data, decoded as far as we can, with its raw bytes.
+/// For `CallFailed`, `reason` is the call's own revert in the same shape, so an app gets the
+/// token's raw revert data as `reason.data` without decoding `CallFailed` itself.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RevertView {
+    pub kind: RevertKind,
+    /// The raw revert data of this level, `0x` hex.
+    pub data: String,
+    /// The first four bytes of `data`, `0x` hex: the error's selector.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selector: Option<String>,
+    /// e.g. `CallFailed`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// e.g. `CallFailed(uint256,bytes)`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature: Option<String>,
+    /// The error's arguments by name, every value a string: `uint`s in decimal, addresses as
+    /// lowercase `0x` hex, strings as they are.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub args: Option<BTreeMap<String, String>>,
+    /// `CallFailed` and `CallTargetHasNoCode`: the deposit's settlement call the error is about.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub call: Option<CallRef>,
+    /// `CallFailed`: the call's own revert (its `revertData`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<Box<RevertView>>,
+}
+
+/// A settlement call, by its position in the deposit's `calls`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CallRef {
+    pub index: u64,
+    pub target: String,
+}
+
+impl RevertView {
+    /// `failure.revert` for `execute`'s revert `data`; `calls` are the deposit's settlement calls.
+    pub fn of_execute(data: &[u8], calls: &[Call]) -> Self {
+        Self::of(data, &decode_execute(data), calls)
+    }
+
+    fn of(data: &[u8], reason: &Reason, calls: &[Call]) -> Self {
+        let kind = match reason {
+            Reason::Empty => RevertKind::Empty,
+            Reason::Unrecognised(_) => RevertKind::Unrecognised,
+            _ => RevertKind::Decoded,
         };
-        if !args.is_empty() {
-            out.insert("args".into(), Value::Object(args.into_iter().map(|(k, v)| (k.to_owned(), v)).collect()));
+        let call = match reason {
+            Reason::CallFailed { index, .. } | Reason::CallTargetHasNoCode { index, .. } => {
+                call_at(*index, calls).map(|call| CallRef {
+                    index: u64::try_from(*index).expect("an index into calls fits u64"),
+                    target: address(call.target),
+                })
+            }
+            _ => None,
+        };
+        Self {
+            kind,
+            data: format!("0x{}", hex::encode(data)),
+            selector: (data.len() >= 4).then(|| format!("0x{}", hex::encode(&data[..4]))),
+            name: reason.name().map(str::to_owned),
+            signature: reason.signature().map(str::to_owned),
+            args: (kind == RevertKind::Decoded)
+                .then(|| reason.args().into_iter().map(|(k, v)| (k.to_owned(), v)).collect()),
+            call,
+            // A call's own revert never refers to the deposit's calls.
+            reason: match reason {
+                Reason::CallFailed { revert_data, reason, .. } => Some(Box::new(Self::of(revert_data, reason, &[]))),
+                _ => None,
+            },
         }
-        if let Self::CallFailed { index, .. } | Self::CallTargetHasNoCode { index, .. } = self
-            && let Some(call) = call_at(*index, calls)
-        {
-            out.insert("call".into(), json!({ "index": index_json(*index), "target": format!("{:#x}", call.target) }));
-        }
-        Value::Object(out)
     }
 }
 
-/// `failure.revert`: the decoded reason of `execute`'s revert `data`, plus the raw bytes.
-pub fn view(data: &Bytes, calls: &[Call]) -> Value {
-    let mut view = decode_execute(data).to_json(calls);
-    view["data"] = json!(data.to_string());
-    view
+fn address(a: Address) -> String {
+    format!("{a:#x}")
 }
 
 fn call_at(index: U256, calls: &[Call]) -> Option<&Call> {
     usize::try_from(index).ok().and_then(|i| calls.get(i))
-}
-
-/// Call indices are small; one that is not is shown as a string rather than lost.
-fn index_json(index: U256) -> Value {
-    u64::try_from(index).map(Value::from).unwrap_or_else(|_| json!(index.to_string()))
 }
 
 /// "call 0 (transfer of 2500000 to 0x…)" for a token transfer; "call 0 (to 0x…)" otherwise.
@@ -295,15 +377,11 @@ fn describe_call(index: U256, calls: &[Call]) -> String {
     }
 }
 
-/// A JSON string without its quotes.
-fn plain(v: &Value) -> String {
-    v.as_str().map(str::to_owned).unwrap_or_else(|| v.to_string())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use alloy_primitives::{address, hex};
+    use serde_json::json;
 
     const USDC: Address = address!("e7f1725E7734CE288F8367e1Bb143E90bb3F0512");
     const RECEIVER: Address = address!("70997970C51812dc3A010C7d01b50e0d17dc79C8");
@@ -359,7 +437,10 @@ mod tests {
         assert_eq!(decode_execute(ALREADY_EXECUTED), Reason::AlreadyDeployed);
         assert!(describe(ALREADY_EXECUTED).starts_with("the payment was already executed"));
 
-        assert_eq!(decode_execute(EXCESS_TO_RECOVERY_FAILED), Reason::Custom { name: "TransferFailed", args: vec![] });
+        assert_eq!(
+            decode_execute(EXCESS_TO_RECOVERY_FAILED),
+            Reason::Custom { signature: "TransferFailed()", args: vec![] }
+        );
         assert_eq!(
             describe(EXCESS_TO_RECOVERY_FAILED),
             "the payment's own transfer of the token to the recovery address failed"
@@ -372,6 +453,7 @@ mod tests {
             decode_execute(BLACKLISTED),
             Reason::CallFailed {
                 index: U256::ZERO,
+                revert_data: alloy_sol_types::Revert::from("Blacklistable: account is blacklisted").abi_encode().into(),
                 reason: Box::new(Reason::Message("Blacklistable: account is blacklisted".into()))
             }
         );
@@ -436,29 +518,83 @@ mod tests {
         let reason = decode_execute(&call_failed(0, long.clone()));
         assert_eq!(
             reason,
-            Reason::CallFailed { index: U256::ZERO, reason: Box::new(Reason::Unrecognised(long.into())) }
+            Reason::CallFailed {
+                index: U256::ZERO,
+                revert_data: long.clone().into(),
+                reason: Box::new(Reason::Unrecognised(long.into()))
+            }
         );
         assert_eq!(reason.label(), "CallFailed:unrecognised");
     }
 
+    fn view(data: &[u8]) -> serde_json::Value {
+        serde_json::to_value(RevertView::of_execute(data, &calls())).unwrap()
+    }
+
+    /// The wire format apps depend on.
     #[test]
-    fn structured_view() {
-        let view = view(&Bytes::from_static(BLACKLISTED), &calls());
+    fn the_view_is_typed_and_carries_raw_data_at_every_level() {
+        let inner = format!(
+            "0x{}",
+            hex::encode(alloy_sol_types::Revert::from("Blacklistable: account is blacklisted").abi_encode())
+        );
         assert_eq!(
-            view,
+            view(BLACKLISTED),
             json!({
-                "name": "CallFailed",
-                "args": { "index": 0, "reason": { "name": "Error", "args": { "message": "Blacklistable: account is blacklisted" } } },
-                "call": { "index": 0, "target": "0xe7f1725e7734ce288f8367e1bb143e90bb3f0512" },
+                "kind": "decoded",
                 "data": format!("0x{}", hex::encode(BLACKLISTED)),
+                "selector": "0x5c0dee5d",
+                "name": "CallFailed",
+                "signature": "CallFailed(uint256,bytes)",
+                "args": { "index": "0" },
+                "call": { "index": 0, "target": "0xe7f1725e7734ce288f8367e1bb143e90bb3f0512" },
+                "reason": {
+                    "kind": "decoded",
+                    "data": inner,
+                    "selector": "0x08c379a0",
+                    "name": "Error",
+                    "signature": "Error(string)",
+                    "args": { "message": "Blacklistable: account is blacklisted" },
+                },
             })
         );
         assert_eq!(
-            decode_execute(UNDERFUNDED).to_json(&calls()),
-            json!({ "name": "InsufficientTokenBalance", "args": { "balance": "1000000", "required": "2500000" } })
+            view(OVERSPENT)["reason"],
+            json!({
+                "kind": "decoded", "data": "0xf4d678b8", "selector": "0xf4d678b8",
+                "name": "InsufficientBalance", "signature": "InsufficientBalance()", "args": {},
+            }),
+            "a decoded error with no arguments still has args"
         );
-        assert_eq!(decode_execute(&hex!("12345678")).to_json(&[]), json!({ "name": null, "selector": "0x12345678" }));
-        assert_eq!(decode_execute(&[]).to_json(&[]), json!({ "name": null }));
+        assert_eq!(
+            view(UNDERFUNDED),
+            json!({
+                "kind": "decoded",
+                "data": format!("0x{}", hex::encode(UNDERFUNDED)),
+                "selector": "0xa17124f8",
+                "name": "InsufficientTokenBalance",
+                "signature": "InsufficientTokenBalance(uint256,uint256)",
+                "args": { "balance": "1000000", "required": "2500000" },
+            })
+        );
+        assert_eq!(
+            view(NO_CODE)["call"],
+            json!({ "index": 0, "target": "0xe7f1725e7734ce288f8367e1bb143e90bb3f0512" })
+        );
+        let unknown = call_failed(0, hex!("deadbeef0001").to_vec());
+        assert_eq!(
+            view(&unknown)["reason"],
+            json!({ "kind": "unrecognised", "data": "0xdeadbeef0001", "selector": "0xdeadbeef" }),
+            "an app can decode the call's raw revert against its own ABIs"
+        );
+        assert_eq!(view(&call_failed(0, vec![]))["reason"], json!({ "kind": "empty", "data": "0x" }));
+        assert_eq!(view(&[]), json!({ "kind": "empty", "data": "0x" }));
+        assert_eq!(view(&hex!("00")), json!({ "kind": "unrecognised", "data": "0x00" }));
+
+        // Clients can deserialize what we serve.
+        let typed: RevertView = serde_json::from_value(view(BLACKLISTED)).unwrap();
+        assert_eq!(typed, RevertView::of_execute(BLACKLISTED, &calls()));
+        assert_eq!(typed.reason.unwrap().kind, RevertKind::Decoded);
     }
 
     #[test]
