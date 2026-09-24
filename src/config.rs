@@ -139,6 +139,12 @@ pub struct AdminConfig {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ChainConfig {
     pub chain_id: u64,
+    /// Offered for new deposits (listed on `/v1/chains`, accepted by `POST /v1/deposit`). A new chain
+    /// ships disabled and is turned on with `GUM_CHAINS__<NAME>__ENABLED=true` once the `PaymentFactory`
+    /// generation is deployed on it and gum-indexer and gum-engine serve it. Deposits already created on
+    /// a disabled chain carry on as usual.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
     #[serde(default)]
     pub tokens: Vec<TokenConfig>,
 }
@@ -186,12 +192,23 @@ impl Config {
         if self.database.url.is_empty() {
             bail!("DATABASE_URL is required");
         }
-        if self.chains.is_empty() {
-            bail!("at least one chain must be configured");
+        if !self.chains.values().any(|c| c.enabled) {
+            bail!("at least one chain must be enabled");
         }
+        let mut chain_ids = std::collections::BTreeMap::new();
         for (name, chain) in &self.chains {
+            if let Some(other) = chain_ids.insert(chain.chain_id, name) {
+                bail!("chains {other} and {name} share chain_id {}", chain.chain_id);
+            }
             if chain.tokens.is_empty() {
                 bail!("chain {name} has no tokens");
+            }
+            let mut symbols = std::collections::BTreeSet::new();
+            let mut addresses = std::collections::BTreeSet::new();
+            for t in &chain.tokens {
+                if !symbols.insert(t.symbol.to_ascii_uppercase()) || !addresses.insert(t.address) {
+                    bail!("chain {name}: duplicate token {}", t.symbol);
+                }
             }
         }
         self.factory_address().context("payments.factory_address")?;
@@ -253,6 +270,10 @@ fn parse_nonzero_address(raw: &str) -> anyhow::Result<Address> {
     Ok(address)
 }
 
+fn default_true() -> bool {
+    true
+}
+
 fn default_paid_repoll_secs() -> i64 {
     30
 }
@@ -271,4 +292,60 @@ fn default_idle_in_transaction_timeout_ms() -> u64 {
 
 fn default_job_timeout_ms() -> u64 {
     30_000
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `config/default.toml` plus the secrets a deploy provides, plus `overrides` (as the
+    /// environment would set them: `GUM_CHAINS__ARC__ENABLED=true` is `[chains.arc] enabled = true`).
+    fn default_with(overrides: &str) -> anyhow::Result<Config> {
+        let config: Config = Figment::from(Toml::string(include_str!("../config/default.toml")))
+            .merge(Toml::string(
+                "[database]\nurl = \"postgres://x\"\n[payments]\n\
+                 factory_address = \"0x6D85B9706D8f076cB8A9fEA37d70Fcb8D22C2952\"\n\
+                 recovery_address = \"0x8093fef21c5d153456a7a39b3b09e69abc01a961\"",
+            ))
+            .merge(Toml::string(overrides))
+            .extract()?;
+        config.validate()?;
+        Ok(config)
+    }
+
+    #[test]
+    fn arc_ships_disabled_and_mirrors_the_indexer_once_enabled() {
+        let config = default_with("").unwrap();
+        assert!(!config.chains["arc"].enabled, "no PaymentFactory on Arc yet; enabled by variable");
+        assert!(["monad", "arbitrum", "base"].iter().all(|c| config.chains[*c].enabled));
+
+        let config = default_with("[chains.arc]\nenabled = true").unwrap();
+        let arc = &config.chains["arc"];
+        assert!(arc.enabled);
+        assert_eq!(arc.chain_id, 5042);
+        // gum-indexer's watches and webhooks use the ERC-20 and 6 decimals (its transfer_log_* keys
+        // are internal to it), and the settlement call targets the same ERC-20.
+        let usdc = &arc.tokens[..];
+        assert_eq!(usdc.len(), 1);
+        assert_eq!(
+            (usdc[0].symbol.as_str(), usdc[0].address, usdc[0].decimals),
+            ("USDC", "0x3600000000000000000000000000000000000000".parse().unwrap(), 6)
+        );
+    }
+
+    #[test]
+    fn chains_are_validated() {
+        let err = |overrides: &str| default_with(overrides).unwrap_err().to_string();
+        assert!(
+            err("[chains.monad]\nenabled = false\n[chains.arbitrum]\nenabled = false\n[chains.base]\nenabled = false")
+                .contains("at least one chain must be enabled")
+        );
+        assert!(err("[chains.arc]\nchain_id = 8453").contains("share chain_id 8453"));
+        let mut config = default_with("").unwrap();
+        let tokens = &mut config.chains.get_mut("base").unwrap().tokens;
+        tokens.push(TokenConfig { symbol: "usdc".into(), address: Address::repeat_byte(1), decimals: 6 });
+        assert!(config.validate().unwrap_err().to_string().contains("chain base: duplicate token usdc"));
+        // Without its table, an ENABLED variable alone is a chain with no chain_id: a boot error.
+        assert!(err("[chains.celo]\nenabled = true").contains("chain_id"));
+    }
 }

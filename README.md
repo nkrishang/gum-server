@@ -17,6 +17,26 @@ app ──POST /v1/deposit──▶ gum-server ──(outbox)──▶ gum-index
                            └──(outbox)──▶ app webhook  deposit.detected / .ready / .settled / .failed
 ```
 
+## Supported chains
+
+| Chain | Tokens |
+|---|---|
+| Monad (143) | USDC, USDT (USDT0), AUSD |
+| Arbitrum One (42161) | USDC, USDT (USDT0) |
+| Base (8453) | USDC |
+| Arc (5042) ¹ | USDC |
+
+All tokens have 6 decimals. `GET /v1/chains` lists the chains offered right now.
+
+¹ Off until `GUM_CHAINS__ARC__ENABLED=true` (see [Adding a chain](#adding-a-chain)). On Arc, USDC is
+the gas token: one balance with a native interface (18 decimals, `msg.value`) and an ERC-20 at
+`0x3600000000000000000000000000000000000000` (6 decimals). A deposit uses the ERC-20 and 6-decimal
+amounts, as on every other chain. The payer may send either way: a plain native USDC send to the
+payment address counts too, because gum-indexer reads Arc's EIP-7708 system emitter, which logs both,
+and reports amounts scaled to 6 decimals. The settlement's `transfer` spends that balance through the
+ERC-20, whichever way it arrived. A native amount below 0.000001 USDC is below the ERC-20's precision: it is not counted,
+and it stays at the payment address.
+
 ## The deposit lifecycle
 
 | Status | Meaning |
@@ -250,7 +270,7 @@ the TTL.
 ```
 POST /v1/webhooks/indexer    gum-indexer events (signed with indexer.webhook_secret)
 POST /v1/webhooks/engine     gum-engine events  (signed with engine.webhook_secret)
-GET  /v1/chains              supported chains, tokens and the factory address
+GET  /v1/chains              chains offered for new deposits, their tokens and the factory address
 GET  /healthz                liveness
 GET  /readyz                 200 when Postgres answers; also reports indexer / engine / privy status
 GET  /metrics                Prometheus
@@ -343,10 +363,37 @@ reconciler, independently of the outbox itself.
 | `GUM_ENGINE__BASE_URL`, `GUM_ENGINE__WEBHOOK_SECRET` | gum-engine's private URL (no auth), its `webhook.signing_secret` |
 | `GUM_ADMIN__TOKEN` | Enables `/v1/admin` |
 | `GUM_SERVER__CORS_ORIGINS` | JSON array of browser origins allowed to call the API (the web UI), e.g. `["https://app.gum.money"]` |
+| `GUM_CHAINS__<NAME>__ENABLED` | `true` / `false`: offer a chain for new deposits. Arc ships `false` |
 | `PORT`, `RUST_LOG` | |
 
 The chain/token registry in `config/default.toml` must mirror gum-indexer's; adding a chain or token
 is a config-only change on both.
+
+### Adding a chain
+
+A chain in `config/default.toml` is offered for new deposits (on `/v1/chains` and by
+`POST /v1/deposit`) only while `enabled` is `true`, the default. A disabled chain still resolves, so
+deposits made on it earlier are unaffected and can still be listed with `?chain_id=`. A new chain ships
+with `enabled = false` and is turned on by setting `GUM_CHAINS__<NAME>__ENABLED=true` on Railway once
+all of these are true:
+
+1. **The `PaymentFactory` generation is deployed on it** at `payments.factory_address`
+   (`cast code <factory> --rpc-url <chain>` is not `0x`). gum-server derives addresses without any
+   RPC, so it cannot check this itself. An address with no factory behind it can be paid, but never
+   settled.
+2. **gum-indexer has the chain enabled** (`chain ready chain=<name>` in its logs). Otherwise watches
+   cannot be registered, and payments are never seen.
+3. **gum-engine has the chain running** (`chain.started` for its chain id, with a funded treasury).
+   Otherwise settlements queue up in the outbox until it does.
+
+Set the variable only after a deploy of the code that has the chain's table. On older code it is a
+chain with no `chain_id`, and the service does not boot. To stop offering a chain, set the variable to
+`false`.
+
+For Arc, as of 2026-09-24: the factory is deployed at the usual address, with the same code as on the
+other chains, and an `execute` simulated on Arc mainnet settles a payment funded with native USDC
+(dust and excess included). gum-indexer ships Arc disabled until its endpoints are set, and gum-engine
+runs it once `GUM_CHAINS__ARC__TREASURY_KEY_ID` is set: steps 2 and 3 remain.
 
 ## Local development
 
@@ -391,5 +438,6 @@ only apps use it. Everything between the three services — API calls out, webho
    this service as `GUM_INDEXER__WEBHOOK_SECRET` / `GUM_ENGINE__WEBHOOK_SECRET`.
 3. On gum-indexer and gum-engine set `GUM_WEBHOOK__HOST_ALLOWLIST=["gum-server.railway.internal"]` so
    they deliver to the private callback host and nowhere else.
-4. On the service: region EU West (same as the other two and Postgres), health check path `/readyz`,
+4. Chains that ship disabled (Arc) are enabled later, one variable each. See [Adding a chain](#adding-a-chain).
+5. On the service: region EU West (same as the other two and Postgres), health check path `/readyz`,
    restart on failure, public domain `api.gum.money`. Scale replicas freely.

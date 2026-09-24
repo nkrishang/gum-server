@@ -114,6 +114,16 @@ token = ""
 
 # ---------------------------------------------------------------------------------------------
 # Chains and tokens. Must mirror gum-indexer's registry; adding one is a config-only change.
+# `address` is the ERC-20 the payment's settlement call targets and the indexer's watches use;
+# amounts are always in its `decimals`.
+#
+# `enabled` (default true) offers the chain for new deposits. Add a chain with `enabled = false`,
+# deploy, and set GUM_CHAINS__<NAME>__ENABLED=true only once all three hold:
+#   1. the PaymentFactory generation is deployed on it (eth_getCode at payments.factory_address),
+#   2. gum-indexer has the chain enabled (`chain ready` in its logs),
+#   3. gum-engine has the chain running (`chain.started` in its logs).
+# Enabled too early, deposits get addresses that nothing watches or settles. The variable is also a
+# boot error ("missing field chain_id") on code that does not have the chain's table yet.
 # ---------------------------------------------------------------------------------------------
 
 [chains.monad]
@@ -153,4 +163,18 @@ chain_id = 8453
 [[chains.base.tokens]]
 symbol = "USDC"
 address = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
+decimals = 6
+
+# Arc (Circle's L1, launched 2026-09-16): USDC is the gas token. One balance, two interfaces:
+# native USDC (18 decimals, msg.value) and the ERC-20 at 0x3600…0000 (6 decimals). A payer may send
+# either way. gum-indexer counts both through Arc's EIP-7708 system emitter and reports 6-decimal
+# amounts against this ERC-20, and the Payment settles through it, so here Arc USDC is an ordinary
+# 6-decimal token. Native dust below 0.000001 USDC is not counted and stays at the payment address.
+[chains.arc]
+chain_id = 5042
+enabled = false
+
+[[chains.arc.tokens]]
+symbol = "USDC"
+address = "0x3600000000000000000000000000000000000000"
 decimals = 6

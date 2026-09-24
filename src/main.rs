@@ -31,7 +31,7 @@ async fn main() -> anyhow::Result<()> {
     let bind = SocketAddr::new(ip, config.server.port);
     let grace = Duration::from_secs(config.server.shutdown_grace_secs);
     let state = AppState::new(config, pool, metrics)?;
-    tracing::info!(chains = ?state.registry.chain_ids(), factory = %state.factory, recovery = %state.recovery, "gum-server configured");
+    tracing::info!(chains = ?state.registry.chain_ids(), disabled_chains = ?state.registry.disabled_chain_ids(), factory = %state.factory, recovery = %state.recovery, "gum-server configured");
 
     let shutdown = CancellationToken::new();
     let workers = {
