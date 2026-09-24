@@ -127,7 +127,7 @@ type Revert = {
   selector?: string;              // first 4 bytes of data, when there are at least 4
   name?: string;                  // decoded: "CallFailed", "Error", "ERC20InsufficientBalance", …
   signature?: string;             // decoded: "CallFailed(uint256,bytes)"
-  args?: Record<string, string>;  // decoded: uints in decimal, addresses as lowercase 0x hex, strings as-is
+  args?: Record<string, string>;  // decoded: uints in decimal, addresses as lowercase 0x hex, strings as-is (a NUL renders as \0)
   call?: { index: number; target: string };  // CallFailed / CallTargetHasNoCode: the deposit's call
   reason?: Revert;                // CallFailed: the call's own revert (its revertData), same shape
 };
@@ -157,17 +157,19 @@ type Revert = {
 | `CallTargetHasNoCode` | A call targets an address with no code on this chain. |
 | `AlreadyDeployed` | The payment was already executed; its receipt says whether it settled or went to recovery. |
 | `DeploymentFailed` | The constructor reverted without data (e.g. out of gas). |
+| `InitCodeTooLarge` | The encoded terms exceed EIP-3860's 49,152-byte init-code limit (`args.length`). |
 | `TransferFailed` | `Payment`'s own transfer of the excess or an expired balance to recovery failed. |
 | `Error` / `Panic` | Solidity's `require`/`revert` string (`args.message`) or panic (`args.code`). |
 | a token's custom error | e.g. `ERC20InsufficientBalance`, `EnforcedPause`, `AccountIsFrozen`, with named `args`. |
 
 `kind: "unrecognised"` is an error we do not know (or a truncated one: `Payment` caps a call's revert
-data at 65,535 bytes); decode `data` yourself. `code` is unchanged: `engine_simulation_reverted` when
-the simulation reverted, `engine_<code>` for the engine's other failures, `expired_on_chain` /
+data at 65,535 bytes); decode `data` yourself. `failure.code` keeps its meaning: `engine_simulation_reverted`
+when the simulation reverted, `engine_<code>` for the engine's other failures (`engine_failed` when it
+sends no error at all, previously the malformed `engine_engine_failed`), `expired_on_chain` /
 `wrong_chain` / `unexpected_outcome` from a receipt. A transaction that reverts once mined carries no
 revert data (the engine does not trace it), so only simulation failures have `revert`. The
 `deposit.failed` event keeps the engine's own message as `data.engine_message`, and the same
-`data.revert`.
+`data.revert` (the old `data.revert_data` key is gone).
 
 ### App webhooks
 

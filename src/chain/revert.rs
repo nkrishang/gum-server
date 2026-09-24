@@ -38,6 +38,7 @@ sol! {
     interface IPaymentFactoryErrors {
         error AlreadyDeployed();
         error DeploymentFailed();
+        error InitCodeTooLarge(uint256 length);
     }
 
     /// Custom errors settlement call targets are known to revert with. Tokens that revert with a
@@ -82,6 +83,8 @@ pub enum Reason {
     AlreadyDeployed,
     /// `PaymentFactory`: the constructor reverted without data (e.g. out of gas).
     DeploymentFailed,
+    /// `PaymentFactory`: the encoded terms exceed EIP-3860's 49,152-byte init-code limit.
+    InitCodeTooLarge { length: U256 },
     /// `Error(string)`: `require(…, "reason")` or `revert("reason")`.
     Message(String),
     /// `Panic(uint256)`: a failed assert, arithmetic overflow, out-of-bounds index, …
@@ -116,6 +119,7 @@ pub fn decode_execute(data: &[u8]) -> Reason {
         return match error {
             E::AlreadyDeployed(_) => Reason::AlreadyDeployed,
             E::DeploymentFailed(_) => Reason::DeploymentFailed,
+            E::InitCodeTooLarge(e) => Reason::InitCodeTooLarge { length: e.length },
         };
     }
     decode_call(data)
@@ -127,7 +131,7 @@ pub fn decode_call(data: &[u8]) -> Reason {
         return Reason::Empty;
     }
     if let Ok(e) = alloy_sol_types::Revert::abi_decode(data) {
-        return Reason::Message(e.reason);
+        return Reason::Message(sanitize(e.reason));
     }
     if let Ok(e) = alloy_sol_types::Panic::abi_decode(data) {
         return Reason::Panic(e.code);
@@ -176,6 +180,7 @@ impl Reason {
             Self::AmountNotSpent { .. } => IPaymentErrors::AmountNotSpent::SIGNATURE,
             Self::AlreadyDeployed => IPaymentFactoryErrors::AlreadyDeployed::SIGNATURE,
             Self::DeploymentFailed => IPaymentFactoryErrors::DeploymentFailed::SIGNATURE,
+            Self::InitCodeTooLarge { .. } => IPaymentFactoryErrors::InitCodeTooLarge::SIGNATURE,
             Self::Message(_) => alloy_sol_types::Revert::SIGNATURE,
             Self::Panic(_) => alloy_sol_types::Panic::SIGNATURE,
             Self::Custom { signature, .. } => signature,
@@ -204,6 +209,7 @@ impl Reason {
             Self::Message(message) => vec![("message", message.clone())],
             Self::Panic(code) => vec![("code", code.to_string())],
             Self::Custom { args, .. } => args.clone(),
+            Self::InitCodeTooLarge { length } => vec![("length", length.to_string())],
             Self::AlreadyDeployed | Self::DeploymentFailed | Self::Empty | Self::Unrecognised(_) => vec![],
         }
     }
@@ -243,6 +249,9 @@ impl Reason {
                  receipt says whether it settled or went to recovery"
                 .to_owned(),
             Self::DeploymentFailed => "the Payment constructor reverted without data (e.g. out of gas)".to_owned(),
+            Self::InitCodeTooLarge { length } => {
+                format!("the encoded payment terms are {length} bytes, past EIP-3860's 49,152-byte init-code limit")
+            }
             Self::Custom { signature, .. } if *signature == ICallTargetErrors::TransferFailed::SIGNATURE => {
                 "the payment's own transfer of the token to the recovery address failed".to_owned()
             }
@@ -364,6 +373,14 @@ fn address(a: Address) -> String {
     format!("{a:#x}")
 }
 
+/// A token's revert string is arbitrary: a `U+0000` in it would reach `failure.message` (a
+/// PostgreSQL `TEXT`) and `revert.args` (`JSONB`), both of which reject NUL, so recording the
+/// failure would fail on every attempt. Render it escaped; the raw bytes stay intact in
+/// `RevertView`'s `data`.
+fn sanitize(message: String) -> String {
+    message.replace('\0', "\\0")
+}
+
 fn call_at(index: U256, calls: &[Call]) -> Option<&Call> {
     usize::try_from(index).ok().and_then(|i| calls.get(i))
 }
@@ -445,6 +462,14 @@ mod tests {
             describe(EXCESS_TO_RECOVERY_FAILED),
             "the payment's own transfer of the token to the recovery address failed"
         );
+
+        let too_large = IPaymentFactoryErrors::InitCodeTooLarge { length: U256::from(49_153u64) }.abi_encode();
+        assert_eq!(decode_execute(&too_large), Reason::InitCodeTooLarge { length: U256::from(49_153u64) });
+        assert_eq!(decode_execute(&too_large).label(), "InitCodeTooLarge");
+        assert_eq!(
+            describe(&too_large),
+            "the encoded payment terms are 49153 bytes, past EIP-3860's 49,152-byte init-code limit"
+        );
     }
 
     #[test]
@@ -508,6 +533,28 @@ mod tests {
         assert_eq!(describe(&alloy_sol_types::Revert::from("nope").abi_encode()), "reverted: nope");
         assert_eq!(decode_execute(&[]), Reason::Empty);
         assert_eq!(describe(&hex!("00")), "reverted: unrecognised data 0x00");
+    }
+
+    /// A NUL in a revert string must not reach `failure.message` (`TEXT`) or `revert.args`
+    /// (`JSONB`): PostgreSQL rejects it, and the failure would never be recorded.
+    #[test]
+    fn a_nul_in_a_revert_string_is_escaped_not_stored_raw() {
+        let inner = alloy_sol_types::Revert::from("bad\0reason").abi_encode();
+        let reason = decode_execute(&call_failed(0, inner.clone()));
+        assert_eq!(
+            reason,
+            Reason::CallFailed {
+                index: U256::ZERO,
+                revert_data: inner.clone().into(),
+                reason: Box::new(Reason::Message("bad\\0reason".into()))
+            }
+        );
+        assert!(!describe(&call_failed(0, inner.clone())).contains('\0'));
+
+        // The raw bytes the app decodes against its own ABIs are untouched.
+        let view = serde_json::to_value(RevertView::of_execute(&call_failed(0, inner.clone()), &calls())).unwrap();
+        assert_eq!(view["reason"]["args"]["message"], "bad\\0reason");
+        assert_eq!(view["reason"]["data"], format!("0x{}", hex::encode(inner)));
     }
 
     #[test]
