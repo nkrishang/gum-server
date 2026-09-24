@@ -399,12 +399,19 @@ async fn submit_execute(state: &AppState, job: &OutboxJob) -> Attempt {
                 "engine_rejected",
                 &message,
                 None,
+                None,
                 json!({ "error": message }),
             )
             .await;
             match failed {
-                Ok(_) => match tx.commit().await {
+                Ok(recorded) => match tx.commit().await {
                     Ok(()) => {
+                        if recorded.is_some() {
+                            // Counted like every other settlement failure (no revert data: the
+                            // engine rejected the submission itself).
+                            tracing::warn!(deposit_id = %deposit.id, code = "engine_rejected", revert = "none", message, "settlement failed");
+                            metrics::counter!("gum_settlement_failures_total", "code" => "engine_rejected", "revert" => "none").increment(1);
+                        }
                         state.outbox_wake.notify_one();
                         Attempt::Dead(message)
                     }

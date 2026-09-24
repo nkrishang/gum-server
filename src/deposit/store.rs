@@ -548,16 +548,19 @@ pub async fn apply_failed(
     code: &str,
     message: &str,
     tx_hash: Option<&str>,
+    revert_data: Option<&alloy_primitives::Bytes>,
     data: Value,
 ) -> Result<Option<Deposit>, sqlx::Error> {
     let deposit: Option<Deposit> = sqlx::query_as(update_deposit(
-        "status = 'failed', failed_at = now(), failure_code = $2, failure_message = $3, tx_hash = COALESCE($4, tx_hash)",
+        "status = 'failed', failed_at = now(), failure_code = $2, failure_message = $3, tx_hash = COALESCE($4, tx_hash), \
+         failure_revert_data = $5",
         "id = $1 AND status = 'paid'",
     ))
     .bind(id)
     .bind(code)
     .bind(message)
     .bind(tx_hash)
+    .bind(revert_data.map(ToString::to_string))
     .fetch_optional(&mut *conn)
     .await?;
     if let Some(d) = &deposit {
@@ -570,7 +573,8 @@ pub async fn apply_failed(
 pub async fn retry_settlement(pool: &PgPool, id: Uuid) -> Result<Option<Deposit>, sqlx::Error> {
     let mut tx = pool.begin().await?;
     let deposit: Option<Deposit> = sqlx::query_as(update_deposit(
-        "status = 'paid', engine_job_id = NULL, engine_submitted_at = NULL, failure_code = NULL, failure_message = NULL, failed_at = NULL",
+        "status = 'paid', engine_job_id = NULL, engine_submitted_at = NULL, failure_code = NULL, failure_message = NULL, \
+         failure_revert_data = NULL, failed_at = NULL",
         "id = $1 AND status = 'failed'",
     ))
     .bind(id)
