@@ -111,6 +111,44 @@ GET /v1/deposit/user/{user_id}     same, for the web UI (403 unless user_id is t
 
 Lists are newest first with keyset pagination: pass `next_cursor` back as `cursor` until it is absent.
 
+#### Why a settlement failed
+
+`failure` is `{ "code", "message" }`, plus `revert` when the chain said why. `PaymentFactory.execute`
+passes on the `Payment` constructor's revert data, which wraps a failing settlement call's own reason,
+and gum-engine reports those bytes when its simulation of `execute` reverts. gum-server decodes them
+([`src/chain/revert.rs`](src/chain/revert.rs)) into a readable `message` and a structured `revert`:
+
+```json
+"failure": {
+  "code": "engine_simulation_reverted",
+  "message": "settlement call 0 (transfer of 2500000 to 0x7099…) reverted: Blacklistable: account is blacklisted",
+  "revert": {
+    "name": "CallFailed",
+    "args": { "index": 0, "reason": { "name": "Error", "args": { "message": "Blacklistable: account is blacklisted" } } },
+    "call": { "index": 0, "target": "0x…token" },
+    "data": "0x5c0dee5d…"
+  }
+}
+```
+
+| `revert.name` | Meaning |
+|---|---|
+| `CallFailed` | Settlement call `args.index` reverted; `args.reason` is the target's own revert, decoded the same way. |
+| `InsufficientTokenBalance` | The address holds `args.balance`, less than the `args.required` it settles. |
+| `AmountNotSpent` | The calls succeeded but left `args.remaining` unspent (e.g. a token that returns `false`). |
+| `CallTargetHasNoCode` | A call targets an address with no code on this chain. |
+| `AlreadyDeployed` | The payment was already executed; its receipt says whether it settled or went to recovery. |
+| `DeploymentFailed` | The constructor reverted without data (e.g. out of gas). |
+| `TransferFailed` | `Payment`'s own transfer of the excess or an expired balance to recovery failed. |
+| `Error` / `Panic` | Solidity's `require`/`revert` string (`args.message`) or panic (`args.code`). |
+| a token's custom error | e.g. `ERC20InsufficientBalance`, `EnforcedPause`, `AccountIsFrozen`, with named `args`. |
+| `null` | Empty revert data, or an error we do not know (`selector` is set). `data` is always the raw bytes. |
+
+`code` is unchanged: `engine_simulation_reverted` when the simulation reverted, `engine_<code>` for
+the engine's other failures, `expired_on_chain` / `wrong_chain` / `unexpected_outcome` from a receipt.
+A transaction that reverts once mined carries no revert data (the engine does not trace it), so only
+simulation failures have `revert`. The engine's own message is kept on the event as `engine_message`.
+
 ### App webhooks
 
 `POST <webhook_url>` with `content-type: application/json`, delivered at-least-once, in order per
@@ -129,7 +167,7 @@ deposit (`sequence`), retried with exponential backoff for 24 h. Respond `2xx` w
 | `deposit.payment_orphaned` | A previously detected transfer was reorged out. It was never counted. |
 | `deposit.ready` | Confirmed total reached the amount. Settlement was submitted. |
 | `deposit.settled` | The receiver was paid. `data.receipt` is the full transaction receipt. Credit the user. |
-| `deposit.failed` | Settlement failed; `deposit.failure` has `code` and `message`. |
+| `deposit.failed` | Settlement failed; `deposit.failure` has `code`, `message` and, when known, `revert` (above). |
 | `deposit.expired` | Expired before the amount was paid. |
 
 Headers: `X-Gum-Event-Id`, `X-Gum-Event-Type`, `X-Gum-Deposit-Id`, `X-Gum-Delivery-Attempt`,
@@ -193,6 +231,11 @@ POST /v1/admin/outbox/{id}/requeue
   succeeded and together they spent exactly `amount`. A `Recovered`-only receipt (executed after
   expiry) is `failed / expired_on_chain`. Engine failures that never executed (`expired`,
   `stuck_cancelled`, `internal`) are resubmitted up to three times before the app is told.
+- **Failures say what went wrong.** A reverted simulation's data is decoded down to the token's own
+  reason (see "Why a settlement failed"), stored raw with the deposit, logged as `settlement failed`
+  with `code` and `revert`, and counted in `gum_settlement_failures_total{code,revert}`. The `revert`
+  label is the error's name, with a failed call's reason appended (`CallFailed:Error`,
+  `CallFailed:ERC20InsufficientBalance`), or `none` / `empty` / `unrecognised`.
 - **A reconciler makes webhooks an optimisation, not a dependency.** Every `reconciler.interval_secs`
   it compares quiet open deposits with the indexer's watch (`GET /v1/watches/{id}`: applies a lost
   `payment.confirmed` / `threshold.reached` / `watch.expired`, re-registers a watch the indexer no longer
@@ -213,7 +256,7 @@ POST /v1/admin/outbox/{id}/requeue
 
 Observability: single-line JSON logs on stdout (`RUST_LOG`; `GUM_LOG_FORMAT=pretty` locally), and
 Prometheus metrics: `gum_http_request_duration_seconds{route,method,status}`,
-`gum_deposits_created_total`, `gum_deposit_transitions_total{event}`,
+`gum_deposits_created_total`, `gum_deposit_transitions_total{event}`, `gum_settlement_failures_total{code,revert}`,
 `gum_inbound_webhooks_total{source,outcome,type}`, `gum_outbox_pending`, `gum_outbox_dead`,
 `gum_outbox_lag_seconds`, `gum_outbox_jobs_total{kind,outcome}`,
 `gum_upstream_request_duration_seconds{service,op,outcome}`, `gum_app_webhook_deliveries_total{outcome}`,

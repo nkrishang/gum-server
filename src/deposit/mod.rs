@@ -12,6 +12,7 @@ use sqlx::types::Json;
 use uuid::Uuid;
 
 use crate::chain::payment::{Call, PaymentTerms};
+use crate::chain::revert;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type)]
 #[sqlx(type_name = "deposit_status", rename_all = "snake_case")]
@@ -83,6 +84,8 @@ pub struct Deposit {
     pub block_number: Option<i64>,
     pub failure_code: Option<String>,
     pub failure_message: Option<String>,
+    /// `0x` hex: `PaymentFactory.execute`'s revert data, when the failure came with it.
+    pub failure_revert_data: Option<String>,
     pub event_seq: i64,
     pub detected_at: Option<DateTime<Utc>>,
     pub settled_at: Option<DateTime<Utc>>,
@@ -96,7 +99,7 @@ pub struct Deposit {
 pub const DEPOSIT_COLUMNS: &str = "id, user_id, chain_id, token_symbol, token_address, token_decimals, amount::text AS amount, \
      receiver, calls, recovery, salt, expires_at, payment_address, reference, webhook_url, status, \
      confirmed_amount::text AS confirmed_amount, watch_id, watch_registered_at, engine_job_id, engine_submitted_at, \
-     tx_hash, block_number, failure_code, failure_message, event_seq, detected_at, settled_at, failed_at, expired_at, \
+     tx_hash, block_number, failure_code, failure_message, failure_revert_data, event_seq, detected_at, settled_at, failed_at, expired_at, \
      created_at, updated_at";
 
 impl Deposit {
@@ -108,12 +111,16 @@ impl Deposit {
         PaymentTerms {
             token: self.token_address.parse().expect("stored addresses are valid"),
             amount: U256::from_str_radix(&self.amount, 10).expect("stored amounts are valid"),
-            calls: self.calls.iter().map(CallView::to_call).collect(),
+            calls: self.calls(),
             expiration_timestamp: self.expires_at.timestamp() as u64,
             recovery: self.recovery.parse().expect("stored addresses are valid"),
             salt: self.salt.parse::<B256>().expect("stored salts are valid"),
             chain_id: self.chain_id as u64,
         }
+    }
+
+    pub fn calls(&self) -> Vec<Call> {
+        self.calls.iter().map(CallView::to_call).collect()
     }
 
     pub fn view(&self) -> DepositView {
@@ -136,10 +143,14 @@ impl Deposit {
             expires_at: self.expires_at,
             tx_hash: self.tx_hash.clone(),
             block_number: self.block_number.map(|n| n as u64),
-            failure: self
-                .failure_code
-                .as_ref()
-                .map(|code| Failure { code: code.clone(), message: self.failure_message.clone().unwrap_or_default() }),
+            failure: self.failure_code.as_ref().map(|code| Failure {
+                code: code.clone(),
+                message: self.failure_message.clone().unwrap_or_default(),
+                revert: self
+                    .failure_revert_data
+                    .as_deref()
+                    .map(|d| revert::view(&d.parse().expect("stored revert data is valid"), &self.calls())),
+            }),
             timestamps: Timestamps {
                 created_at: self.created_at,
                 updated_at: self.updated_at,
@@ -213,6 +224,9 @@ impl From<&Call> for CallView {
 pub struct Failure {
     pub code: String,
     pub message: String,
+    /// Why `PaymentFactory.execute` reverted, decoded from its revert data (see `chain::revert`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revert: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

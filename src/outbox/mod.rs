@@ -399,6 +399,7 @@ async fn submit_execute(state: &AppState, job: &OutboxJob) -> Attempt {
                 "engine_rejected",
                 &message,
                 None,
+                None,
                 json!({ "error": message }),
             )
             .await;

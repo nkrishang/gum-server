@@ -64,6 +64,13 @@ fn settled_receipt(payment_address: &str) -> Value {
     ]})
 }
 
+/// `PaymentFactory.execute`'s revert data when the receiver is blacklisted by the token, from
+/// `eth_estimateGas` on Anvil (see `chain::revert`'s tests).
+const BLACKLISTED: &str = "0x5c0dee5d00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000040000000000000000000000000000000000000000000000000000000000000008408c379a000000000000000000000000000000000000000000000000000000000000000200000000000000000000000000000000000000000000000000000000000000025426c61636b6c69737461626c653a206163636f756e7420697320626c61636b6c697374656400000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000";
+
+/// The same, when the payment address holds 1000000 of the 2500000 it settles.
+const UNDERFUNDED: &str = "0xa17124f800000000000000000000000000000000000000000000000000000000000f424000000000000000000000000000000000000000000000000000000000002625a0";
+
 fn engine_event(
     event_id: &str,
     event: &str,
@@ -611,11 +618,12 @@ async fn settlement_failure_expiry_and_operator_retry() {
     .await;
 
     // The engine's simulation reverted: a permanent failure the app hears about. Here the
-    // receiver is blacklisted by USDC, so settlement call 0 (the transfer) fails.
+    // receiver is blacklisted by USDC, so settlement call 0 (the transfer) fails. The node's own
+    // message only names the selector; the revert data says what happened.
     let error = json!({
         "code": "simulation_reverted",
-        "message": "execution reverted: CallFailed(0, Blacklistable: account is blacklisted)",
-        "revert_data": "0x5c0dee5d00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000040000000000000000000000000000000000000000000000000000000000000008408c379a000000000000000000000000000000000000000000000000000000000000000200000000000000000000000000000000000000000000000000000000000000025426c61636b6c69737461626c653a206163636f756e7420697320626c61636b6c697374656400000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+        "message": "gas estimation failed: execution reverted: custom error 0x5c0dee5d: 0000…",
+        "revert_data": BLACKLISTED,
     });
     let res = h
         .deliver(
@@ -631,7 +639,23 @@ async fn settlement_failure_expiry_and_operator_retry() {
             app_deliveries(&h, &webhook_secret).await.into_iter().find(|d| d["type"] == "deposit.failed")
         })
         .await;
-    assert_eq!(failed["deposit"]["failure"]["code"], "engine_simulation_reverted");
+    let failure = &failed["deposit"]["failure"];
+    assert_eq!(failure["code"], "engine_simulation_reverted");
+    assert_eq!(
+        failure["message"],
+        "settlement call 0 (transfer of 2500000 to 0x70997970c51812dc3a010c7d01b50e0d17dc79c8) reverted: \
+         Blacklistable: account is blacklisted"
+    );
+    assert_eq!(failure["revert"]["name"], "CallFailed");
+    assert_eq!(failure["revert"]["call"], json!({ "index": 0, "target": USDC.to_ascii_lowercase() }));
+    assert_eq!(failure["revert"]["args"]["reason"]["args"]["message"], "Blacklistable: account is blacklisted");
+    assert_eq!(failure["revert"]["data"], BLACKLISTED);
+    // The engine's own words stay on the timeline.
+    assert_eq!(
+        failed["data"]["engine_message"],
+        "gas estimation failed: execution reverted: custom error 0x5c0dee5d: 0000…"
+    );
+    assert_eq!(failed["data"]["revert"], failure["revert"]);
 
     // Operator retry queues a fresh execute under a new idempotency key.
     let res = h
@@ -649,7 +673,8 @@ async fn settlement_failure_expiry_and_operator_retry() {
         .send()
         .await
         .unwrap();
-    assert_eq!(res.status(), 200, "{}", res.text().await.unwrap());
+    let retried: Value = res.json().await.unwrap();
+    assert!(retried.get("failure").is_none(), "a retried deposit carries no stale failure: {retried}");
     assert_eq!(h.deposit_status(id).await, "paid");
     h.wait_for("second engine submission", Duration::from_secs(5), || async {
         let reqs = h.engine.received_requests().await.unwrap();
@@ -1223,4 +1248,124 @@ async fn the_outbox_backlog_is_measured_from_outside() {
     assert_eq!(due, 1);
     assert!(oldest > gum_server::reconciler::OUTBOX_STALL_SECS, "{oldest}");
     gum_server::reconciler::tick(&h.state).await.unwrap();
+}
+
+/// A failed job found by polling explains itself exactly like one reported by webhook, and a
+/// failure without revert data keeps the engine's own code and message.
+#[tokio::test]
+async fn the_reconciler_explains_failed_settlements_too() {
+    let h = harness!();
+    mount_upstreams(&h).await;
+    let key = h.api_key_for("did:privy:gwen").await;
+    let created: Value = h
+        .http
+        .post(h.url("/v1/deposit"))
+        .bearer_auth(&key)
+        .json(&deposit_body())
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let id: Uuid = created["id"].as_str().unwrap().parse().unwrap();
+    let payment_address = created["payment_address"].as_str().unwrap().to_owned();
+    let engine_job = || async {
+        sqlx::query_as::<_, (Option<Uuid>,)>("SELECT engine_job_id FROM deposits WHERE id = $1")
+            .bind(id)
+            .fetch_one(&h.pool)
+            .await
+            .unwrap()
+            .0
+    };
+    h.wait_for("watch", Duration::from_secs(5), || async {
+        sqlx::query_as::<_, (Option<Uuid>,)>("SELECT watch_id FROM deposits WHERE id = $1")
+            .bind(id)
+            .fetch_one(&h.pool)
+            .await
+            .unwrap()
+            .0
+    })
+    .await;
+    h.deliver(
+        "/v1/webhooks/indexer",
+        INDEXER_SECRET,
+        &indexer_event("t-1", "threshold.reached", &payment_address, "2500000", None),
+    )
+    .await;
+    h.wait_for("engine submission", Duration::from_secs(5), engine_job).await;
+    let view = || async {
+        h.http
+            .get(h.url(&format!("/v1/deposit/id/{id}")))
+            .bearer_auth(&key)
+            .send()
+            .await
+            .unwrap()
+            .json::<Value>()
+            .await
+            .unwrap()
+    };
+
+    // 1. A failure the engine did not explain with revert data reads as it always has.
+    Mock::given(method("GET"))
+        .and(path(format!("/v1/transactions/{JOB_ID}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "job_id": JOB_ID, "chain_id": 31337, "status": "failed",
+            "error": { "code": "invalid_tx", "message": "worst-case cost exceeds max_job_cost", "revert_data": null }
+        })))
+        .up_to_n_times(1)
+        .mount(&h.engine)
+        .await;
+    age(&h.pool, id, 3600).await;
+    gum_server::reconciler::tick(&h.state).await.unwrap();
+    assert_eq!(h.deposit_status(id).await, "failed");
+    let failure = view().await["failure"].clone();
+    assert_eq!(
+        failure,
+        json!({ "code": "engine_invalid_tx", "message": "worst-case cost exceeds max_job_cost" }),
+        "no revert data, no revert"
+    );
+
+    // 2. After an operator retry, the simulation reverts: the address is underfunded.
+    let res = h
+        .http
+        .post(h.url(&format!("/v1/admin/deposits/{id}/retry-settlement")))
+        .bearer_auth(ADMIN_TOKEN)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+    h.wait_for("resubmission", Duration::from_secs(5), engine_job).await;
+    Mock::given(method("GET"))
+        .and(path(format!("/v1/transactions/{JOB_ID}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "job_id": JOB_ID, "chain_id": 31337, "status": "failed",
+            "error": {
+                "code": "simulation_reverted",
+                "message": "gas estimation failed: execution reverted: custom error 0xa17124f8: 0000…",
+                "revert_data": UNDERFUNDED,
+            }
+        })))
+        .mount(&h.engine)
+        .await;
+    age(&h.pool, id, 3600).await;
+    gum_server::reconciler::tick(&h.state).await.unwrap();
+    assert_eq!(h.deposit_status(id).await, "failed");
+    let view = view().await;
+    assert_eq!(
+        view["failure"],
+        json!({
+            "code": "engine_simulation_reverted",
+            "message": "the payment address holds 1000000, less than the 2500000 it settles",
+            "revert": {
+                "name": "InsufficientTokenBalance",
+                "args": { "balance": "1000000", "required": "2500000" },
+                "data": UNDERFUNDED,
+            }
+        })
+    );
+    let last = view["events"].as_array().unwrap().last().unwrap().clone();
+    assert_eq!(last["type"], "deposit.failed");
+    assert_eq!(last["data"]["source"], "reconciler");
+    assert_eq!(last["data"]["revert_data"], UNDERFUNDED);
 }
