@@ -177,7 +177,7 @@ async fn reconcile_paid(state: &AppState) -> anyhow::Result<()> {
         let tx_hash = job.tx_hash.map(|h| format!("{h:#x}"));
         let data = json!({
             "engine_job_id": job_id, "polled_at": Utc::now(), "status": job.status, "outcome": job.outcome,
-            "tx_hash": tx_hash, "source": "reconciler",
+            "tx_hash": tx_hash, "block_number": job.block_number, "source": "reconciler",
         });
         let outcome = match job.status.as_str() {
             "confirmed" => SettlementOutcome::from_receipt(
