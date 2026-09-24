@@ -234,7 +234,7 @@ async fn view(
     Ok(Json(PayerView::new(&deposit, events, Utc::now())))
 }
 
-fn no_such_deposit() -> ApiError {
+pub(crate) fn no_such_deposit() -> ApiError {
     ApiError::not_found("no such deposit")
 }
 

@@ -23,6 +23,7 @@ pub struct Config {
     pub outbox: OutboxConfig,
     pub reconciler: ReconcilerConfig,
     pub admin: AdminConfig,
+    pub relay: RelayConfig,
     #[serde(default)]
     pub chains: BTreeMap<String, ChainConfig>,
 }
@@ -136,6 +137,33 @@ pub struct AdminConfig {
     pub token: String,
 }
 
+/// Relay (relay.link): pays a deposit from any token on any chain Relay supports, by bridging or
+/// swapping into the deposit's exact token and amount at its payment address. See `relay`.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct RelayConfig {
+    pub base_url: String,
+    /// `RELAY_API_KEY` (or `GUM_RELAY__API_KEY`). Without it the payer routes are off.
+    #[serde(default)]
+    pub api_key: String,
+    pub timeout_ms: u64,
+    /// Relay's `referrer`: who sent the request, for their attribution and analytics.
+    pub referrer: String,
+    /// How long Relay's chain list is reused before it is fetched again.
+    pub chains_ttl_secs: u64,
+    /// A quote is refused when the deposit expires sooner than this: a route that lands after
+    /// `expires_at` pays an expired address, and the funds go to recovery.
+    pub min_time_left_secs: i64,
+    /// Quotes a minute from this replica, under Relay's per-key limit.
+    pub quotes_per_minute: u32,
+    /// Quotes a minute for one deposit: a payer trying a few tokens, not a script.
+    pub quotes_per_deposit_per_minute: u32,
+    /// Every other Relay call a minute from this replica (chains, tokens, prices, status), under
+    /// Relay's per-key limit for them (200).
+    pub reads_per_minute: u32,
+    /// Token searches, prices and route statuses a minute for one deposit.
+    pub reads_per_deposit_per_minute: u32,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ChainConfig {
     pub chain_id: u64,
@@ -181,6 +209,9 @@ impl Config {
         }
         if let Ok(url) = std::env::var("DATABASE_URL") {
             figment = figment.merge(Serialized::default("database.url", url));
+        }
+        if let Ok(key) = std::env::var("RELAY_API_KEY") {
+            figment = figment.merge(Serialized::default("relay.api_key", key.trim().to_owned()));
         }
         let mut config: Config = figment.extract().context("invalid configuration")?;
         // Railway and most dashboards store multi-line secrets with literal "\n".
@@ -254,6 +285,9 @@ impl Config {
             out.push(
                 "indexer.webhook_secret / engine.webhook_secret are empty: inbound webhooks will be rejected".into(),
             );
+        }
+        if self.relay.api_key.is_empty() {
+            out.push("RELAY_API_KEY is empty: payers can only pay in the deposit's own token and chain".into());
         }
         if self.webhooks.allow_insecure_targets {
             out.push("webhooks.allow_insecure_targets is on: app webhooks may target private hosts".into());

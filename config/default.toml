@@ -108,6 +108,26 @@ paid_repoll_secs = 30
 open_stale_secs = 900
 idempotency_ttl_secs = 86400
 
+[relay]
+# Relay (relay.link) lets a payer pay a deposit with any token on any chain Relay supports: the
+# pay page asks for a quote whose destination is pinned to the deposit's chain, token, exact
+# remaining amount and payment address (see src/relay). The key comes from RELAY_API_KEY.
+base_url = "https://api.relay.link"
+timeout_ms = 8000
+referrer = "gum.money"
+chains_ttl_secs = 600
+# No quote when the deposit closes sooner than this: a route landing after expires_at pays an
+# expired address (recovered, not settled). Cross-chain fills take seconds; this is the margin.
+min_time_left_secs = 120
+# Relay allows 50 quotes a minute per key (more on request): each replica stays under that, and
+# one deposit gets a payer's worth of them. Over either, the page is told to wait (429).
+quotes_per_minute = 45
+quotes_per_deposit_per_minute = 12
+# Relay allows 200 other calls a minute per key (chains, tokens, prices, route status). Chains are
+# cached, tokens and prices for a minute, a route's status for 2s; the rest counts against these.
+reads_per_minute = 150
+reads_per_deposit_per_minute = 60
+
 [admin]
 # Bearer token for /v1/admin routes. Empty disables them.
 token = ""
