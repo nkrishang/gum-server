@@ -7,7 +7,7 @@ Rust (axum + sqlx + Postgres), deployed on Railway.
 Every blockchain interaction is delegated: [gum-indexer](https://github.com/nkrishang/gum-indexer)
 watches the address, [gum-engine](https://github.com/nkrishang/gum-engine) executes the settlement, and
 both call back into this service. gum-server itself never opens an RPC connection, so the request path
-is a CREATE3 computation and one database transaction.
+is a CREATE2 computation and one database transaction.
 
 ```
 app ──POST /v1/deposit──▶ gum-server ──(outbox)──▶ gum-indexer  POST /v1/watches
@@ -24,15 +24,29 @@ app ──POST /v1/deposit──▶ gum-server ──(outbox)──▶ gum-index
 | `pending` | Address issued and watched. Waiting for the payer. |
 | `partial_paid` | gum-indexer saw a transfer (pending at head, or confirmed below the amount). |
 | `paid` | Confirmed total ≥ amount. `PaymentFactory.execute` submitted to gum-engine. |
-| `settled` | `Payment` deployed; the receipt carries `Settled(receiver, amount)`. Terminal. |
+| `settled` | `Payment` deployed; its settlement calls paid the receiver and the receipt carries `Settled(token, amount)`. Terminal. |
 | `failed` | Settlement failed (`failure.code` says why). Retryable by an operator. Terminal. |
 | `expired` | `expires_at` passed before the amount was paid. Anything sent later is recoverable. Terminal. |
 
-The payment address is `PaymentFactory.paymentAddress(token, amount, receiver, expirationTimestamp,
+The payment address is `PaymentFactory.paymentAddress(token, amount, calls, expirationTimestamp,
 recovery, salt, chainId)` from [gum-contracts](https://github.com/nkrishang/gum-contracts), computed
 off-chain ([`src/chain/payment.rs`](src/chain/payment.rs)) and pinned against the deployed factory by
-tests. `recovery` is always this service's own privileged address (`payments.recovery_address`); `salt`
-is random per deposit. The address commits to all seven terms, so nobody can redirect the funds.
+tests. `calls` is the ordered list of calls the payment makes on settlement; for a deposit it is the single
+call `token.transfer(receiver, amount)`, stored with the deposit and returned as `calls`. `recovery` is
+always this service's own privileged address (`payments.recovery_address`); `salt` is random per deposit.
+The address commits to all seven terms, including every call target and every byte of calldata, so
+nobody can redirect the funds.
+
+```
+terms    = abi.encode(token, amount, calls, expirationTimestamp, recovery, salt, chainId)
+initCode = Payment.creationCode ++ abi.encode(CREATE(factory, nonce = 1), terms)
+payment  = CREATE2(factory, bytes32(0), keccak256(initCode))
+```
+
+`Payment.creationCode` belongs to one contract generation and is pinned in
+[`src/chain/payment_creation_code.hex`](src/chain/payment_creation_code.hex). `payments.factory_address`
+must be a factory of that generation: pointing it at another generation derives addresses that factory
+will never deploy.
 
 ## API
 
@@ -79,7 +93,9 @@ Idempotency-Key: <≤128 chars, optional but recommended>
 ```json
 { "id": "…", "status": "pending", "payment_address": "0x…", "chain_id": 8453,
   "token": "USDC", "token_address": "0x…", "token_decimals": 6,
-  "amount": "2500000", "confirmed_amount": "0", "receiver": "0x…", "recovery": "0x…", "salt": "0x…",
+  "amount": "2500000", "confirmed_amount": "0", "receiver": "0x…",
+  "calls": [{ "target": "0x…token", "data": "0xa9059cbb…" }],   // token.transfer(receiver, amount)
+  "recovery": "0x…", "salt": "0x…",
   "reference": "0x…", "webhook_url": "…", "expires_at": "…",
   "tx_hash": null, "block_number": null, "failure": null,
   "timestamps": { "created_at": "…", "updated_at": "…", "detected_at": null, "settled_at": null, "failed_at": null, "expired_at": null } }
@@ -94,6 +110,66 @@ GET /v1/deposit/user/{user_id}     same, for the web UI (403 unless user_id is t
 ```
 
 Lists are newest first with keyset pagination: pass `next_cursor` back as `cursor` until it is absent.
+
+#### Why a settlement failed
+
+`failure` is `{ "code", "message" }`, plus `revert` when the chain said why. `PaymentFactory.execute`
+passes on the `Payment` constructor's revert data, which wraps a failing settlement call's own revert
+data, and gum-engine reports those bytes when its simulation of `execute` reverts. gum-server decodes
+them ([`src/chain/revert.rs`](src/chain/revert.rs)) into a readable `message` and a typed `revert`.
+Every level of `revert` carries its raw bytes, so an app can always decode them itself, e.g. against
+its own contracts' ABIs:
+
+```ts
+type Revert = {
+  kind: "decoded" | "empty" | "unrecognised";
+  data: string;                   // this level's raw revert data, 0x hex ("0x" when empty)
+  selector?: string;              // first 4 bytes of data, when there are at least 4
+  name?: string;                  // decoded: "CallFailed", "Error", "ERC20InsufficientBalance", …
+  signature?: string;             // decoded: "CallFailed(uint256,bytes)"
+  args?: Record<string, string>;  // decoded: uints in decimal, addresses as lowercase 0x hex, strings as-is (a NUL renders as \0)
+  call?: { index: number; target: string };  // CallFailed / CallTargetHasNoCode: the deposit's call
+  reason?: Revert;                // CallFailed: the call's own revert (its revertData), same shape
+};
+```
+
+```json
+"failure": {
+  "code": "engine_simulation_reverted",
+  "message": "settlement call 0 (transfer of 2500000 to 0x7099…) reverted: Blacklistable: account is blacklisted",
+  "revert": {
+    "kind": "decoded", "data": "0x5c0dee5d…", "selector": "0x5c0dee5d",
+    "name": "CallFailed", "signature": "CallFailed(uint256,bytes)", "args": { "index": "0" },
+    "call": { "index": 0, "target": "0x…token" },
+    "reason": {
+      "kind": "decoded", "data": "0x08c379a0…", "selector": "0x08c379a0",
+      "name": "Error", "signature": "Error(string)", "args": { "message": "Blacklistable: account is blacklisted" }
+    }
+  }
+}
+```
+
+| `revert.name` | Meaning |
+|---|---|
+| `CallFailed` | Settlement call `args.index` reverted; `reason` is the target's own revert. |
+| `InsufficientTokenBalance` | The address holds `args.balance`, less than the `args.required` it settles. |
+| `AmountNotSpent` | The calls succeeded but left `args.remaining` unspent (e.g. a token that returns `false`). |
+| `CallTargetHasNoCode` | A call targets an address with no code on this chain. |
+| `AlreadyDeployed` | The payment was already executed; its receipt says whether it settled or went to recovery. |
+| `DeploymentFailed` | The constructor reverted without data (e.g. out of gas). |
+| `InitCodeTooLarge` | The encoded terms exceed EIP-3860's 49,152-byte init-code limit (`args.length`). |
+| `TransferFailed` | `Payment`'s own transfer of the excess or an expired balance to recovery failed. |
+| `Error` / `Panic` | Solidity's `require`/`revert` string (`args.message`) or panic (`args.code`). |
+| a token's custom error | e.g. `ERC20InsufficientBalance`, `EnforcedPause`, `AccountIsFrozen`, with named `args`. |
+
+`kind: "unrecognised"` is an error we do not know (or a truncated one: `Payment` caps a call's revert
+data at 65,535 bytes); decode `data` yourself. `failure.code` keeps its meaning: `engine_simulation_reverted`
+when the simulation reverted, `engine_<code>` for the engine's other failures (`engine_failed` when it
+sends no error at all, previously the malformed `engine_engine_failed`), `expired_on_chain` /
+`wrong_chain` / `unexpected_outcome` from a receipt. A transaction that reverts once mined carries no
+revert data (the engine does not trace it), so only simulation failures have `revert`. The
+`deposit.failed` event keeps the engine's own message as `data.engine_message`, and the same
+`data.revert` (the old `data.revert_data` key is gone).
 
 ### App webhooks
 
@@ -113,7 +189,7 @@ deposit (`sequence`), retried with exponential backoff for 24 h. Respond `2xx` w
 | `deposit.payment_orphaned` | A previously detected transfer was reorged out. It was never counted. |
 | `deposit.ready` | Confirmed total reached the amount. Settlement was submitted. |
 | `deposit.settled` | The receiver was paid. `data.receipt` is the full transaction receipt. Credit the user. |
-| `deposit.failed` | Settlement failed; `deposit.failure` has `code` and `message`. |
+| `deposit.failed` | Settlement failed; `deposit.failure` has `code`, `message` and, when known, `revert` (above). |
 | `deposit.expired` | Expired before the amount was paid. |
 
 Headers: `X-Gum-Event-Id`, `X-Gum-Event-Type`, `X-Gum-Deposit-Id`, `X-Gum-Delivery-Attempt`,
@@ -173,9 +249,15 @@ POST /v1/admin/outbox/{id}/requeue
   engine submission (a crash between submit and record cannot broadcast twice); indexer registration
   is idempotent on the address.
 - **Settlement is verified, not assumed.** `settled` requires the engine's receipt to contain
-  `Settled(receiver, amount)` from the payment address. A `Recovered`-only receipt (executed after
+  `Settled(token, amount)` from the payment address, which `Payment` emits only after every call
+  succeeded and together they spent exactly `amount`. A `Recovered`-only receipt (executed after
   expiry) is `failed / expired_on_chain`. Engine failures that never executed (`expired`,
   `stuck_cancelled`, `internal`) are resubmitted up to three times before the app is told.
+- **Failures say what went wrong.** A reverted simulation's data is decoded down to the token's own
+  reason (see "Why a settlement failed"), stored raw with the deposit, logged as `settlement failed`
+  with `code` and `revert`, and counted in `gum_settlement_failures_total{code,revert}`. The `revert`
+  label is the error's name, with a failed call's reason appended (`CallFailed:Error`,
+  `CallFailed:ERC20InsufficientBalance`), or `none` / `empty` / `unrecognised`.
 - **A reconciler makes webhooks an optimisation, not a dependency.** Every `reconciler.interval_secs`
   it compares quiet open deposits with the indexer's watch (`GET /v1/watches/{id}`: applies a lost
   `payment.confirmed` / `threshold.reached` / `watch.expired`, re-registers a watch the indexer no longer
@@ -196,7 +278,7 @@ POST /v1/admin/outbox/{id}/requeue
 
 Observability: single-line JSON logs on stdout (`RUST_LOG`; `GUM_LOG_FORMAT=pretty` locally), and
 Prometheus metrics: `gum_http_request_duration_seconds{route,method,status}`,
-`gum_deposits_created_total`, `gum_deposit_transitions_total{event}`,
+`gum_deposits_created_total`, `gum_deposit_transitions_total{event}`, `gum_settlement_failures_total{code,revert}`,
 `gum_inbound_webhooks_total{source,outcome,type}`, `gum_outbox_pending`, `gum_outbox_dead`,
 `gum_outbox_lag_seconds`, `gum_outbox_jobs_total{kind,outcome}`,
 `gum_upstream_request_duration_seconds{service,op,outcome}`, `gum_app_webhook_deliveries_total{outcome}`,
@@ -254,8 +336,8 @@ The end-to-end suite starts the real server on a random port with a fresh databa
 stubs gum-indexer, gum-engine and the app webhook with wiremock. It walks the whole lifecycle
 (create → watch registered → partial_paid → paid → execute submitted → settled → app notified),
 idempotency, key rotation, pagination, ownership, signature verification, failure, automatic and
-operator retries, and expiry. The CREATE3 derivation and the `Settled` topic are pinned against
-values observed from the real contracts on Anvil.
+operator retries, and expiry. The CREATE2 derivation, the `execute` calldata and the `Settled` event
+are pinned against values observed from the real contracts on Anvil.
 
 ## Deploying
 

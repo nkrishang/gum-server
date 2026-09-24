@@ -1,6 +1,7 @@
 //! Supported chains and tokens (mirrors gum-indexer's registry) and the on-chain payment maths.
 
 pub mod payment;
+pub mod revert;
 
 use std::collections::BTreeMap;
 use std::sync::Arc;

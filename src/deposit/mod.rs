@@ -4,13 +4,15 @@ pub mod request;
 pub mod routes;
 pub mod store;
 
-use alloy_primitives::{Address, B256, U256};
+use alloy_primitives::{Address, B256, Bytes, U256};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::FromRow;
+use sqlx::types::Json;
 use uuid::Uuid;
 
-use crate::chain::payment::PaymentTerms;
+use crate::chain::payment::{Call, PaymentTerms};
+use crate::chain::revert::RevertView;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type)]
 #[sqlx(type_name = "deposit_status", rename_all = "snake_case")]
@@ -64,6 +66,8 @@ pub struct Deposit {
     pub token_decimals: i16,
     pub amount: String,
     pub receiver: String,
+    /// The settlement calls the payment address commits to, in order.
+    pub calls: Json<Vec<CallView>>,
     pub recovery: String,
     pub salt: String,
     pub expires_at: DateTime<Utc>,
@@ -80,6 +84,8 @@ pub struct Deposit {
     pub block_number: Option<i64>,
     pub failure_code: Option<String>,
     pub failure_message: Option<String>,
+    /// `0x` hex: `PaymentFactory.execute`'s revert data, when the failure came with it.
+    pub failure_revert_data: Option<String>,
     pub event_seq: i64,
     pub detected_at: Option<DateTime<Utc>>,
     pub settled_at: Option<DateTime<Utc>>,
@@ -91,9 +97,9 @@ pub struct Deposit {
 
 /// Columns selected for every `Deposit` read.
 pub const DEPOSIT_COLUMNS: &str = "id, user_id, chain_id, token_symbol, token_address, token_decimals, amount::text AS amount, \
-     receiver, recovery, salt, expires_at, payment_address, reference, webhook_url, status, \
+     receiver, calls, recovery, salt, expires_at, payment_address, reference, webhook_url, status, \
      confirmed_amount::text AS confirmed_amount, watch_id, watch_registered_at, engine_job_id, engine_submitted_at, \
-     tx_hash, block_number, failure_code, failure_message, event_seq, detected_at, settled_at, failed_at, expired_at, \
+     tx_hash, block_number, failure_code, failure_message, failure_revert_data, event_seq, detected_at, settled_at, failed_at, expired_at, \
      created_at, updated_at";
 
 impl Deposit {
@@ -105,12 +111,16 @@ impl Deposit {
         PaymentTerms {
             token: self.token_address.parse().expect("stored addresses are valid"),
             amount: U256::from_str_radix(&self.amount, 10).expect("stored amounts are valid"),
-            receiver: self.receiver.parse().expect("stored addresses are valid"),
+            calls: self.calls(),
             expiration_timestamp: self.expires_at.timestamp() as u64,
             recovery: self.recovery.parse().expect("stored addresses are valid"),
             salt: self.salt.parse::<B256>().expect("stored salts are valid"),
             chain_id: self.chain_id as u64,
         }
+    }
+
+    pub fn calls(&self) -> Vec<Call> {
+        self.calls.iter().map(CallView::to_call).collect()
     }
 
     pub fn view(&self) -> DepositView {
@@ -125,6 +135,7 @@ impl Deposit {
             amount: self.amount.clone(),
             confirmed_amount: self.confirmed_amount.clone(),
             receiver: self.receiver.clone(),
+            calls: self.calls.0.clone(),
             recovery: self.recovery.clone(),
             salt: self.salt.clone(),
             reference: self.reference.clone(),
@@ -132,10 +143,13 @@ impl Deposit {
             expires_at: self.expires_at,
             tx_hash: self.tx_hash.clone(),
             block_number: self.block_number.map(|n| n as u64),
-            failure: self
-                .failure_code
-                .as_ref()
-                .map(|code| Failure { code: code.clone(), message: self.failure_message.clone().unwrap_or_default() }),
+            failure: self.failure_code.as_ref().map(|code| Failure {
+                code: code.clone(),
+                message: self.failure_message.clone().unwrap_or_default(),
+                revert: self.failure_revert_data.as_deref().map(|d| {
+                    RevertView::of_execute(&d.parse::<Bytes>().expect("stored revert data is valid"), &self.calls())
+                }),
+            }),
             timestamps: Timestamps {
                 created_at: self.created_at,
                 updated_at: self.updated_at,
@@ -163,6 +177,8 @@ pub struct DepositView {
     pub amount: String,
     pub confirmed_amount: String,
     pub receiver: String,
+    /// What the payment does on settlement. Committed into `payment_address`, so anyone can check it.
+    pub calls: Vec<CallView>,
     pub recovery: String,
     pub salt: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -181,10 +197,35 @@ pub struct DepositView {
     pub events: Option<Vec<DepositEventView>>,
 }
 
+/// A settlement call as stored and served: `target` and `data` as lowercase `0x` hex.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CallView {
+    pub target: String,
+    pub data: String,
+}
+
+impl CallView {
+    pub fn to_call(&self) -> Call {
+        Call {
+            target: self.target.parse().expect("stored addresses are valid"),
+            data: self.data.parse::<Bytes>().expect("stored calldata is valid"),
+        }
+    }
+}
+
+impl From<&Call> for CallView {
+    fn from(call: &Call) -> Self {
+        Self { target: format!("{:#x}", call.target), data: call.data.to_string() }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Failure {
     pub code: String,
     pub message: String,
+    /// Why `PaymentFactory.execute` reverted, decoded from its revert data, with the raw bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revert: Option<RevertView>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

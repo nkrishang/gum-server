@@ -8,7 +8,7 @@
 //!                            └──(outbox)──▶ app webhook   deposit.detected / confirmed / settled / failed
 //! ```
 //!
-//! The request path computes a CREATE3 address and writes one transaction; everything that
+//! The request path computes a CREATE2 address and writes one transaction; everything that
 //! touches a chain is delegated and driven by webhooks plus a transactional outbox.
 
 pub mod account;

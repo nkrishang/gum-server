@@ -25,6 +25,8 @@ use uuid::Uuid;
 
 use super::sign;
 use crate::chain::payment::{self, ExecutionOutcome, ReceiptLog};
+use crate::chain::revert::{self, RevertView};
+use crate::clients::engine::EngineError;
 use crate::deposit::{Deposit, store};
 use crate::error::ApiError;
 use crate::state::AppState;
@@ -191,16 +193,7 @@ pub struct EngineEvent {
     #[serde(default)]
     pub reincluded: bool,
     #[serde(default)]
-    pub error: Option<EngineErrorDetail>,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct EngineErrorDetail {
-    pub code: String,
-    #[serde(default)]
-    pub message: String,
-    #[serde(default)]
-    pub revert_data: Option<String>,
+    pub error: Option<EngineError>,
 }
 
 pub async fn engine(State(state): State<AppState>, headers: HeaderMap, body: Bytes) -> Result<StatusCode, ApiError> {
@@ -261,6 +254,8 @@ pub enum SettlementOutcome {
         code: String,
         message: String,
         tx_hash: Option<String>,
+        /// `execute`'s revert data, when the engine had it; stored and decoded as `failure.revert`.
+        revert_data: Option<alloy_primitives::Bytes>,
         data: Value,
     },
     /// Nothing terminal yet.
@@ -289,17 +284,11 @@ impl SettlementOutcome {
                 tx_hash,
                 block_number,
                 event.receipt.as_ref(),
-                event.error.as_ref().map(|e| (e.code.as_str(), e.message.as_str(), e.revert_data.as_deref())),
+                event.error.as_ref(),
                 deposit,
                 data,
             ),
-            "transaction.failed" => {
-                let (code, message) =
-                    event.error.as_ref().map(|e| (e.code.clone(), e.message.clone())).unwrap_or_else(|| {
-                        ("engine_failed".to_owned(), "the engine could not execute the transaction".to_owned())
-                    });
-                Self::Failed { code: format!("engine_{code}"), message, tx_hash, data }
-            }
+            "transaction.failed" => Self::engine_failure(event.error.as_ref(), tx_hash, deposit, data),
             _ => Self::Pending,
         }
     }
@@ -311,7 +300,7 @@ impl SettlementOutcome {
         tx_hash: Option<String>,
         block_number: Option<i64>,
         receipt: Option<&Value>,
-        error: Option<(&str, &str, Option<&str>)>,
+        error: Option<&EngineError>,
         deposit: &Deposit,
         data: Value,
     ) -> Self {
@@ -333,39 +322,59 @@ impl SettlementOutcome {
                         message: "the payment expired before it was executed; the balance was forwarded to recovery"
                             .into(),
                         tx_hash: Some(tx_hash),
+                        revert_data: None,
                         data,
                     },
                     ExecutionOutcome::WrongChain => Self::Failed {
                         code: "wrong_chain".into(),
                         message: "Payment was deployed on a chain other than the deposit's".into(),
                         tx_hash: Some(tx_hash),
+                        revert_data: None,
                         data,
                     },
                     ExecutionOutcome::NoEvents => Self::Failed {
                         code: "unexpected_outcome".into(),
                         message: "execute succeeded but the payment address emitted no Settled event".into(),
                         tx_hash: Some(tx_hash),
+                        revert_data: None,
                         data,
                     },
                 }
             }
-            Some("reverted") => {
-                let (code, message, revert_data) =
-                    error.unwrap_or(("execution_reverted", "PaymentFactory.execute reverted", None));
-                data["revert_data"] = json!(revert_data);
-                Self::Failed {
-                    code: format!("engine_{code}"),
-                    message: if message.is_empty() {
-                        "PaymentFactory.execute reverted".into()
-                    } else {
-                        message.to_owned()
-                    },
-                    tx_hash: Some(tx_hash),
-                    data,
-                }
-            }
+            Some("reverted") => Self::engine_failure(error, Some(tx_hash), deposit, data),
             _ => Self::Pending,
         }
+    }
+
+    /// A job the engine failed, or an `execute` that reverted on chain. When the engine has
+    /// `execute`'s revert data (its simulation reverted), the failure says what went wrong,
+    /// decoded; otherwise it carries the engine's own code and message, as before.
+    pub fn engine_failure(
+        error: Option<&EngineError>,
+        tx_hash: Option<String>,
+        deposit: &Deposit,
+        data: Value,
+    ) -> Self {
+        let mut data = data;
+        // A mined transaction (`tx_hash`) failed by reverting; one that never executed, because
+        // the engine gave up on it.
+        let (default_code, default_message) = match tx_hash {
+            Some(_) => ("execution_reverted", "PaymentFactory.execute reverted"),
+            None => ("failed", "the engine could not execute the transaction"),
+        };
+        let code = error.map_or(default_code, |e| e.code.as_str());
+        let engine_message = error.map(|e| e.message.as_str()).filter(|m| !m.is_empty()).unwrap_or(default_message);
+        let revert_data = error.and_then(EngineError::revert_bytes);
+        data["engine_message"] = json!(engine_message);
+        let message = match &revert_data {
+            Some(bytes) => {
+                let calls = deposit.calls();
+                data["revert"] = json!(RevertView::of_execute(bytes, &calls));
+                revert::decode_execute(bytes).describe(&calls)
+            }
+            None => engine_message.to_owned(),
+        };
+        Self::Failed { code: format!("engine_{code}"), message, tx_hash, revert_data, data }
     }
 }
 
@@ -383,7 +392,7 @@ pub async fn apply_settlement(
         SettlementOutcome::Settled { tx_hash, block_number, data } => {
             store::apply_settled(conn, deposit.id, &tx_hash, block_number, data).await?.is_some()
         }
-        SettlementOutcome::Failed { code, message, tx_hash, data } => {
+        SettlementOutcome::Failed { code, message, tx_hash, revert_data, data } => {
             // A job the engine gave up on before it ever executed is resubmitted a few times
             // before the app is told about a failure.
             let engine_code = code.strip_prefix("engine_").unwrap_or(&code);
@@ -400,7 +409,18 @@ pub async fn apply_settlement(
                         .await;
                 }
             }
-            store::apply_failed(conn, deposit.id, &code, &message, tx_hash.as_deref(), data).await?.is_some()
+            let failed =
+                store::apply_failed(conn, deposit.id, &code, &message, tx_hash.as_deref(), revert_data.as_ref(), data)
+                    .await?
+                    .is_some();
+            if failed {
+                // One label per decoded error (`CallFailed:Error`), so alerts can tell a paused
+                // token from a blacklisted receiver from an underfunded address.
+                let revert = revert_data.as_ref().map_or("none".to_owned(), |d| revert::decode_execute(d).label());
+                tracing::warn!(deposit_id = %deposit.id, code, revert, message, "settlement failed");
+                metrics::counter!("gum_settlement_failures_total", "code" => code, "revert" => revert).increment(1);
+            }
+            failed
         }
         SettlementOutcome::Pending => {
             tracing::debug!(deposit_id = %deposit.id, source_event, "non-terminal engine event");

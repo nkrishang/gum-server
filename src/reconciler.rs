@@ -185,17 +185,11 @@ async fn reconcile_paid(state: &AppState) -> anyhow::Result<()> {
                 tx_hash,
                 job.block_number.map(|n| n as i64),
                 job.receipt.as_ref(),
-                job.error.as_ref().map(|e| (e.code.as_str(), e.message.as_str(), None)),
+                job.error.as_ref(),
                 &deposit,
                 data,
             ),
-            "failed" => {
-                let (code, message) =
-                    job.error.as_ref().map(|e| (e.code.clone(), e.message.clone())).unwrap_or_else(|| {
-                        ("engine_failed".to_owned(), "the engine could not execute the transaction".to_owned())
-                    });
-                SettlementOutcome::Failed { code: format!("engine_{code}"), message, tx_hash, data }
-            }
+            "failed" => SettlementOutcome::engine_failure(job.error.as_ref(), tx_hash, &deposit, data),
             _ => {
                 // Still in flight; do not re-poll every tick.
                 store::touch(&state.pool, deposit.id).await?;

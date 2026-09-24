@@ -37,11 +37,30 @@ pub struct Submitted {
     pub replayed: bool,
 }
 
+/// Why the engine failed a job, on webhooks and on `GET /v1/transactions/{id}`.
 #[derive(Debug, Deserialize)]
 pub struct EngineError {
     pub code: String,
     #[serde(default)]
     pub message: String,
+    /// `0x` hex. Set when the engine's simulation (gas estimation) reverted: for
+    /// `PaymentFactory.execute`, the `Payment` constructor's own revert data.
+    #[serde(default)]
+    pub revert_data: Option<String>,
+}
+
+impl EngineError {
+    /// The revert data as bytes; `None` when there is none or it is not valid hex.
+    pub fn revert_bytes(&self) -> Option<Bytes> {
+        let raw = self.revert_data.as_deref()?;
+        match raw.parse::<Bytes>() {
+            Ok(bytes) => Some(bytes),
+            Err(err) => {
+                tracing::warn!(revert_data = raw, error = %err, "engine revert data is not hex; ignored");
+                None
+            }
+        }
+    }
 }
 
 /// The subset of `GET /v1/transactions/{job_id}` the reconciler needs.
