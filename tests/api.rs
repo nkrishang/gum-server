@@ -331,6 +331,36 @@ async fn full_deposit_lifecycle() {
             "deposit.settled",
         ]
     );
+
+    // 8. The payer's view of the same deposit: the payer-facing timeline, projected data.
+    let res = h.http.get(h.url(&format!("/v1/pay/{id}"))).send().await.unwrap();
+    assert_eq!(res.status(), 200);
+    let pay: Value = res.json().await.unwrap();
+    assert_eq!(pay["status"], "settled");
+    assert_eq!(pay["sequence"], view["events"].as_array().unwrap().last().unwrap()["sequence"]);
+    assert_eq!(pay["tx_hash"], "0xe15d10f3812c0d9a6c0d30cf5e84868309e0cc28b0fd7272f03df90ca4de222c");
+    assert_eq!(pay["block_number"], 5);
+    let timeline: Vec<&str> = pay["events"].as_array().unwrap().iter().map(|e| e["type"].as_str().unwrap()).collect();
+    assert_eq!(
+        timeline,
+        [
+            "deposit.created",
+            "deposit.detected",
+            "deposit.payment_confirmed",
+            "deposit.ready",
+            "deposit.settlement_submitted",
+            "deposit.settlement_included",
+            "deposit.settled",
+        ]
+    );
+    let settled = pay["events"].as_array().unwrap().last().unwrap();
+    assert_eq!(
+        settled["data"],
+        json!({ "tx_hash": "0xe15d10f3812c0d9a6c0d30cf5e84868309e0cc28b0fd7272f03df90ca4de222c", "block_number": 5 }),
+        "no receipt, no engine ids"
+    );
+    assert_eq!(pay["events"][1]["data"]["transfer"]["tx_hash"], "0x11");
+
     // Nothing left to do and nothing dead.
     let (pending,): (i64,) = sqlx::query_as("SELECT count(*) FROM outbox").fetch_one(&h.pool).await.unwrap();
     assert_eq!(pending, 0);
@@ -1395,4 +1425,151 @@ async fn the_reconciler_explains_failed_settlements_too() {
     assert_eq!(last["type"], "deposit.failed");
     assert_eq!(last["data"]["source"], "reconciler");
     assert_eq!(last["data"]["revert"], view["failure"]["revert"]);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Payer view (GET /v1/pay/{id})
+// ---------------------------------------------------------------------------------------------
+
+/// Creates a deposit and waits for its watch, so no outbox write moves its sequence afterwards.
+async fn watched_deposit(h: &Harness, key: &str) -> (Uuid, String) {
+    let created: Value = h
+        .http
+        .post(h.url("/v1/deposit"))
+        .bearer_auth(key)
+        .json(&deposit_body())
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let id: Uuid = created["id"].as_str().unwrap().parse().unwrap();
+    h.wait_for("watch", Duration::from_secs(5), || async { watch_id(h, id).await }).await;
+    (id, created["payment_address"].as_str().unwrap().to_owned())
+}
+
+/// A client that outlives the longest hold (the harness client gives up after 5 s).
+fn long_poll_client() -> reqwest::Client {
+    reqwest::Client::builder().timeout(Duration::from_secs(20)).build().unwrap()
+}
+
+#[tokio::test]
+async fn pay_view_is_public_and_payer_safe() {
+    let h = harness!();
+    mount_upstreams(&h).await;
+    let key = h.api_key_for("did:privy:ivy").await;
+
+    // Unknown and malformed ids are both 404, without credentials.
+    for id in [Uuid::now_v7().to_string(), "not-a-uuid".to_owned()] {
+        let res = h.http.get(h.url(&format!("/v1/pay/{id}"))).send().await.unwrap();
+        assert_eq!(res.status(), 404);
+        assert_eq!(res.headers()["cache-control"], "no-store");
+        let body: Value = res.json().await.unwrap();
+        assert_eq!(body["error"]["code"], "not_found");
+        assert_eq!(body["error"]["message"], "no such deposit");
+    }
+
+    let mut body = deposit_body();
+    body["webhook_url"] = json!(format!("{}/hooks", h.app.uri()));
+    let created: Value =
+        h.http.post(h.url("/v1/deposit")).bearer_auth(&key).json(&body).send().await.unwrap().json().await.unwrap();
+    let id = created["id"].as_str().unwrap();
+    let res = h.http.get(h.url(&format!("/v1/pay/{id}"))).send().await.unwrap();
+    assert_eq!(res.status(), 200);
+    assert_eq!(res.headers()["cache-control"], "no-store");
+    let view: Value = res.json().await.unwrap();
+    for private in ["user_id", "receiver", "recovery", "salt", "reference", "webhook_url", "watch_id", "engine_job_id"]
+    {
+        assert!(view.get(private).is_none(), "{private} leaked: {view}");
+    }
+    for field in ["payment_address", "chain_id", "token", "token_address", "token_decimals", "amount", "expires_at"] {
+        assert_eq!(view[field], created[field], "{field}");
+    }
+    assert_eq!(view["id"], id);
+    assert_eq!(view["status"], "pending");
+    assert_eq!(view["confirmed_amount"], "0");
+    assert!(view["sequence"].as_i64().unwrap() >= 1);
+    assert!(view.get("tx_hash").is_none() && view.get("failure").is_none());
+    assert!(view["timestamps"]["created_at"].is_string());
+    // RFC 3339 with milliseconds, UTC.
+    let server_time = view["server_time"].as_str().unwrap();
+    assert_eq!(server_time.len(), "2026-09-24T12:00:00.000Z".len(), "{server_time}");
+    let parsed = chrono::DateTime::parse_from_rfc3339(server_time).unwrap();
+    assert!((Utc::now() - parsed.with_timezone(&Utc)).num_seconds().abs() < 5);
+    // Operational events (watch registration) are not the payer's business.
+    let types: Vec<&str> = view["events"].as_array().unwrap().iter().map(|e| e["type"].as_str().unwrap()).collect();
+    assert_eq!(types, ["deposit.created"]);
+    assert_eq!(view["events"][0]["data"], json!({}));
+}
+
+#[tokio::test]
+async fn pay_view_long_poll_wakes_on_a_detected_payment() {
+    let h = harness!();
+    mount_upstreams(&h).await;
+    let key = h.api_key_for("did:privy:jack").await;
+    let (id, payment_address) = watched_deposit(&h, &key).await;
+    let view: Value = h.http.get(h.url(&format!("/v1/pay/{id}"))).send().await.unwrap().json().await.unwrap();
+    let sequence = view["sequence"].as_i64().unwrap();
+
+    let started = std::time::Instant::now();
+    let poll = tokio::spawn(long_poll_client().get(h.url(&format!("/v1/pay/{id}?after={sequence}&wait=5"))).send());
+    // Let the request reach its wait before the payment is reported.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(!poll.is_finished(), "returned before anything changed");
+    let transfer = json!({ "tx_hash": "0x11", "log_index": 1, "block_number": 10, "block_hash": "0x22", "from": "0x0000000000000000000000000000000000000009", "amount": "2500000", "status": "pending" });
+    let delivered = std::time::Instant::now();
+    let ev = indexer_event("lp-1", "payment.pending", &payment_address, "0", Some(transfer.clone()));
+    assert_eq!(h.deliver("/v1/webhooks/indexer", INDEXER_SECRET, &ev).await.status(), 200);
+
+    let res = poll.await.unwrap().unwrap();
+    let woke_after = delivered.elapsed();
+    assert_eq!(res.status(), 200);
+    assert!(woke_after < Duration::from_secs(1), "long poll took {woke_after:?} after the payment");
+    assert!(started.elapsed() < Duration::from_secs(3), "{:?}", started.elapsed());
+    let view: Value = res.json().await.unwrap();
+    assert_eq!(view["status"], "partial_paid");
+    assert!(view["sequence"].as_i64().unwrap() > sequence);
+    assert!(view["timestamps"]["detected_at"].is_string());
+    let detected = view["events"].as_array().unwrap().iter().find(|e| e["type"] == "deposit.detected").unwrap();
+    assert_eq!(detected["data"]["transfer"], transfer);
+    assert_eq!(detected["data"]["confirmed_amount"], "0");
+    assert!(detected["data"].get("indexer_event_id").is_none(), "{detected}");
+}
+
+#[tokio::test]
+async fn pay_view_long_poll_returns_at_once_when_behind_and_at_the_deadline_otherwise() {
+    let h = harness!();
+    mount_upstreams(&h).await;
+    let key = h.api_key_for("did:privy:kate").await;
+    let (id, _) = watched_deposit(&h, &key).await;
+    let view: Value = h.http.get(h.url(&format!("/v1/pay/{id}"))).send().await.unwrap().json().await.unwrap();
+    let sequence = view["sequence"].as_i64().unwrap();
+    let client = long_poll_client();
+
+    // The client is behind: nothing to wait for.
+    let started = std::time::Instant::now();
+    let res = client.get(h.url(&format!("/v1/pay/{id}?after={}&wait=25", sequence - 1))).send().await.unwrap();
+    assert_eq!(res.status(), 200);
+    assert!(started.elapsed() < Duration::from_millis(500), "{:?}", started.elapsed());
+    assert_eq!(res.json::<Value>().await.unwrap()["sequence"], sequence);
+
+    // Up to date and nothing happens: held for the wait, then the unchanged view.
+    let started = std::time::Instant::now();
+    let res = client.get(h.url(&format!("/v1/pay/{id}?after={sequence}&wait=1"))).send().await.unwrap();
+    assert_eq!(res.status(), 200);
+    let held = started.elapsed();
+    assert!(held >= Duration::from_millis(950) && held < Duration::from_secs(3), "{held:?}");
+    let view: Value = res.json().await.unwrap();
+    assert_eq!(view["sequence"], sequence);
+    assert_eq!(view["status"], "pending");
+
+    // Without `after` there is nothing to wait for, whatever `wait` says.
+    let started = std::time::Instant::now();
+    assert_eq!(client.get(h.url(&format!("/v1/pay/{id}?wait=25"))).send().await.unwrap().status(), 200);
+    assert!(started.elapsed() < Duration::from_millis(500), "{:?}", started.elapsed());
+    // Malformed parameters are rejected in the usual error shape.
+    let res = client.get(h.url(&format!("/v1/pay/{id}?after=x"))).send().await.unwrap();
+    assert_eq!(res.status(), 400);
+    assert_eq!(res.json::<Value>().await.unwrap()["error"]["code"], "invalid_request");
 }

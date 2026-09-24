@@ -171,6 +171,40 @@ revert data (the engine does not trace it), so only simulation failures have `re
 `deposit.failed` event keeps the engine's own message as `data.engine_message`, and the same
 `data.revert` (the old `data.revert_data` key is gone).
 
+### Payer view (hosted pay page)
+
+```
+GET /v1/pay/{id}?after=<sequence>&wait=<seconds>     no auth; always Cache-Control: no-store
+```
+
+For gum.money/pay/{id}. The deposit id is the capability (UUIDv7: not enumerable), so the view is
+payer-safe: no owner, `receiver`, `recovery`, `salt`, `reference`, `webhook_url`, engine ids,
+receipts or failure messages. Unknown or malformed ids are `404 not_found`.
+
+```json
+{ "id": "…", "status": "partial_paid", "sequence": 3, "payment_address": "0x…", "chain_id": 8453,
+  "token": "USDC", "token_address": "0x…", "token_decimals": 6, "amount": "2500000", "confirmed_amount": "0",
+  "expires_at": "…", "tx_hash": "0x…", "block_number": 123, "failure": { "code": "…" },   // last three only when set
+  "timestamps": { …as above… }, "server_time": "2026-09-24T12:00:00.123Z",
+  "events": [ { "id": "…", "sequence": 3, "type": "deposit.detected", "created_at": "…",
+                "data": { "transfer": { "tx_hash", "log_index", "block_number", "block_hash", "from", "amount", "status" },
+                          "confirmed_amount": "0" } } ] }
+```
+
+`events` is oldest first and limited to `deposit.created / detected / payment_confirmed /
+payment_orphaned / ready / settlement_submitted / settlement_included / settled / failed / expired`;
+their sequences have gaps (internal events are hidden, but still advance `sequence`). `data` keeps
+only `transfer`, `confirmed_amount`, `tx_hash`, `block_number` and, on `deposit.failed`, `code`.
+`server_time` lets the page correct the payer's clock.
+
+**Long polling.** With `after` and `wait` (0–25, default 0), a request whose deposit `sequence` is
+still `<= after` is held until it moves past `after` or the wait ends, then answered `200` with the
+current view (never 304/204). Holds are capped 1 s under `server.request_timeout_ms` (so 9 s by
+default); poll again with the returned `sequence`. Every transition runs `pg_notify` in its
+transaction; each replica `LISTEN`s and wakes its waiting requests on commit, so a payment shows up
+within milliseconds whichever replica processed it. A notification lost while the listener
+reconnects only delays the page until its next poll.
+
 ### App webhooks
 
 `POST <webhook_url>` with `content-type: application/json`, delivered at-least-once, in order per
@@ -284,9 +318,9 @@ Prometheus metrics: `gum_http_request_duration_seconds{route,method,status}`,
 `gum_upstream_request_duration_seconds{service,op,outcome}`, `gum_app_webhook_deliveries_total{outcome}`,
 `gum_auth_total{method,outcome}`, `gum_db_errors_total`, `gum_deposits_paid`,
 `gum_deposits_paid_oldest_age_seconds`, `gum_outbox_due`, `gum_outbox_oldest_due_age_seconds`,
-`gum_panics_total`, `gum_task_restarts_total{task}`. Alert on any panic or task restart: the outbox and
-reconciler run under a supervisor that restarts them (`background task stopped unexpectedly`), and panics
-are logged as structured `"message":"panic"` errors.
+`gum_panics_total`, `gum_task_restarts_total{task}`. Alert on any panic or task restart: the outbox,
+reconciler and deposit feed run under a supervisor that restarts them (`background task stopped
+unexpectedly`), and panics are logged as structured `"message":"panic"` errors.
 Alert on `gum_outbox_dead > 0`, on `gum_outbox_lag_seconds` p99, on `/readyz` flipping, on
 `gum_deposits_paid_oldest_age_seconds` above a few minutes (settlement takes seconds, so an old
 `paid` deposit means engine webhooks are not landing), and on

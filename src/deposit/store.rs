@@ -13,7 +13,7 @@ use sqlx::{AssertSqlSafe, PgConnection, PgPool, Postgres, QueryBuilder};
 use uuid::Uuid;
 
 use super::request::NewDeposit;
-use super::{CallView, DEPOSIT_COLUMNS, Deposit, DepositEvent, DepositStatus, events};
+use super::{CallView, DEPOSIT_COLUMNS, Deposit, DepositEvent, DepositStatus, events, feed};
 
 fn hex_lower(address: Address) -> String {
     format!("{address:#x}")
@@ -175,6 +175,27 @@ pub async fn events(pool: &PgPool, deposit_id: Uuid) -> Result<Vec<DepositEvent>
         .await
 }
 
+/// The deposit's events of the given `types`, oldest first, up to and including sequence
+/// `through`. Pass the `event_seq` read with the deposit row: a transition changes the row and
+/// appends its event in one transaction, so bounding by it keeps the two reads consistent even if
+/// another transition commits in between.
+pub async fn events_through(
+    pool: &PgPool,
+    deposit_id: Uuid,
+    through: i64,
+    types: &[&str],
+) -> Result<Vec<DepositEvent>, sqlx::Error> {
+    sqlx::query_as(
+        "SELECT id, deposit_id, sequence, type, data, created_at FROM deposit_events \
+         WHERE deposit_id = $1 AND sequence <= $2 AND type = ANY($3) ORDER BY sequence",
+    )
+    .bind(deposit_id)
+    .bind(through)
+    .bind(types)
+    .fetch_all(pool)
+    .await
+}
+
 #[derive(Debug, Default, Clone)]
 pub struct ListFilter {
     pub status: Option<DepositStatus>,
@@ -259,8 +280,8 @@ pub async fn list(pool: &PgPool, user_id: &str, filter: &ListFilter) -> Result<P
 // Events and outbox
 // ---------------------------------------------------------------------------------------------
 
-/// Appends to the deposit's timeline and, for app-facing events, queues the app webhook with a
-/// snapshot of the deposit as it is now.
+/// Appends to the deposit's timeline, wakes long-polling readers of the deposit (on commit), and,
+/// for app-facing events, queues the app webhook with a snapshot of the deposit as it is now.
 pub async fn record_event(
     conn: &mut PgConnection,
     deposit: &Deposit,
@@ -283,6 +304,14 @@ pub async fn record_event(
     .bind(&data)
     .fetch_one(&mut *conn)
     .await?;
+    // Delivered by Postgres only if and when this transaction commits, to every replica's
+    // `feed` listener; several in one transaction collapse into one. Commits that notify are
+    // serialised by Postgres, which is negligible at a handful of transitions per deposit.
+    sqlx::query("SELECT pg_notify($1, $2)")
+        .bind(feed::CHANNEL)
+        .bind(deposit.id.to_string())
+        .execute(&mut *conn)
+        .await?;
     metrics::counter!("gum_deposit_transitions_total", "event" => event_type.to_owned()).increment(1);
 
     if events::is_app_facing(event_type)
@@ -564,6 +593,12 @@ pub async fn apply_failed(
     .fetch_optional(&mut *conn)
     .await?;
     if let Some(d) = &deposit {
+        // The code goes on the event too, so the timeline alone says why; the message stays on
+        // the deposit (it can be internal, and the payer view only shows the code).
+        let mut data = data;
+        if let Some(fields) = data.as_object_mut() {
+            fields.insert("code".into(), json!(code));
+        }
         record_event(conn, d, events::FAILED, data).await?;
     }
     Ok(deposit)

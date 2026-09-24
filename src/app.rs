@@ -19,7 +19,7 @@ use tower_http::trace::TraceLayer;
 use uuid::Uuid;
 
 use crate::auth::Admin;
-use crate::deposit::{DepositView, routes as deposit, store};
+use crate::deposit::{DepositView, pay, routes as deposit, store};
 use crate::error::ApiError;
 use crate::state::AppState;
 use crate::telemetry;
@@ -35,6 +35,8 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/deposit", post(deposit::create).get(deposit::list_mine))
         .route("/v1/deposit/id/{id}", get(deposit::get_by_id))
         .route("/v1/deposit/user/{user_id}", get(deposit::list_for_user))
+        // The payer's side of it (hosted pay page). No auth: the deposit id is the capability.
+        .route("/v1/pay/{id}", get(pay::get))
         // Account and API key management (web UI).
         .route("/v1/account", get(account::get).patch(account::update))
         .route("/v1/account/api-key", post(account::create_key))

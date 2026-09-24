@@ -4,6 +4,7 @@ use std::time::Duration;
 
 use anyhow::Context;
 use gum_server::config::Config;
+use gum_server::deposit::feed;
 use gum_server::state::AppState;
 use gum_server::{app, db, outbox, reconciler, supervise, telemetry};
 use tokio::signal;
@@ -41,6 +42,10 @@ async fn main() -> anyhow::Result<()> {
         let (state, shutdown) = (state.clone(), shutdown.clone());
         supervise::spawn("reconciler", shutdown.clone(), move || reconciler::run(state.clone(), shutdown.clone()))
     };
+    let feed = {
+        let (state, shutdown) = (state.clone(), shutdown.clone());
+        supervise::spawn("deposit_feed", shutdown.clone(), move || feed::run(state.clone(), shutdown.clone()))
+    };
 
     let listener = tokio::net::TcpListener::bind(bind).await.with_context(|| format!("binding {bind}"))?;
     tracing::info!(%bind, "listening");
@@ -57,6 +62,7 @@ async fn main() -> anyhow::Result<()> {
     let _ = tokio::time::timeout(grace, async {
         let _ = workers.await;
         let _ = reconciler.await;
+        let _ = feed.await;
     })
     .await;
     state.pool.close().await;

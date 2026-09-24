@@ -8,7 +8,8 @@ use alloy_primitives::Address;
 use metrics_exporter_prometheus::PrometheusHandle;
 use moka::sync::Cache;
 use sqlx::PgPool;
-use tokio::sync::Notify;
+use tokio::sync::{Notify, broadcast};
+use uuid::Uuid;
 
 use crate::auth::api_key::KeyCache;
 use crate::auth::privy::PrivyVerifier;
@@ -16,6 +17,7 @@ use crate::chain::Registry;
 use crate::clients::engine::EngineClient;
 use crate::clients::indexer::IndexerClient;
 use crate::config::Config;
+use crate::deposit::feed;
 
 #[derive(Clone)]
 pub struct AppState(Arc<Inner>);
@@ -35,6 +37,9 @@ pub struct Inner {
     pub metrics: PrometheusHandle,
     /// Woken after an outbox row is committed so workers pick it up without waiting for the poll tick.
     pub outbox_wake: Notify,
+    /// Ids of deposits whose transitions just committed, on any replica (see `deposit::feed`).
+    /// Long-polling payer views wait on it.
+    pub deposit_changes: broadcast::Sender<Uuid>,
     /// Users whose `last_seen_at` / keys whose `last_used_at` were touched recently; throttles writes.
     pub touched: Cache<String, ()>,
 }
@@ -67,6 +72,7 @@ impl AppState {
             recovery,
             metrics,
             outbox_wake: Notify::new(),
+            deposit_changes: feed::sender(),
             touched: Cache::builder().max_capacity(100_000).time_to_live(Duration::from_secs(60)).build(),
         })))
     }

@@ -1,5 +1,7 @@
 //! Deposit requests: the server's own representation of a one-time payment address.
 
+pub mod feed;
+pub mod pay;
 pub mod request;
 pub mod routes;
 pub mod store;

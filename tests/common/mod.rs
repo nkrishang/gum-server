@@ -11,6 +11,7 @@ use std::time::Duration;
 use alloy_primitives::address;
 use chrono::Utc;
 use gum_server::config::{ChainConfig, Config, TokenConfig};
+use gum_server::deposit::feed;
 use gum_server::state::AppState;
 use gum_server::webhooks::sign;
 use gum_server::{app, outbox, reconciler, supervise};
@@ -141,6 +142,25 @@ impl Harness {
         {
             let (state, shutdown) = (state.clone(), shutdown.clone());
             supervise::spawn("reconciler", shutdown.clone(), move || reconciler::run(state.clone(), shutdown.clone()));
+        }
+        {
+            let (state, shutdown) = (state.clone(), shutdown.clone());
+            supervise::spawn("deposit_feed", shutdown.clone(), move || feed::run(state.clone(), shutdown.clone()));
+        }
+        // Long-poll tests must not race the feed's startup: wait until its `LISTEN` has run.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let (listening,): (i64,) = sqlx::query_as(
+                "SELECT count(*) FROM pg_stat_activity WHERE datname = current_database() AND query LIKE 'LISTEN %'",
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("pg_stat_activity");
+            if listening > 0 {
+                break;
+            }
+            assert!(tokio::time::Instant::now() < deadline, "deposit feed did not start listening");
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
         let router = app::router(state.clone());
         let server_shutdown = shutdown.clone();
