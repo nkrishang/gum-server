@@ -510,6 +510,18 @@ mod tests {
             "settlement call 0 (transfer of 2500000 to 0x70997970c51812dc3a010c7d01b50e0d17dc79c8) reverted: \
              ERC20InsufficientBalance(sender: 0x1111111111111111111111111111111111111112, balance: 0, needed: 1000000)"
         );
+        // Arc USDC (FiatToken over the native balance, at 0x3600…), observed on Arc mainnet via eth_call
+        // of transfer(…, 1000000) from an address holding none: a plain Error(string).
+        let arc_usdc = hex!(
+            "08c379a0"
+            "0000000000000000000000000000000000000000000000000000000000000020"
+            "0000000000000000000000000000000000000000000000000000000000000026"
+            "45524332303a207472616e7366657220616d6f756e7420657863656564732062"
+            "616c616e63650000000000000000000000000000000000000000000000000000"
+        );
+        assert!(
+            describe(&call_failed(0, arc_usdc.to_vec())).ends_with("reverted: ERC20: transfer amount exceeds balance")
+        );
         let frozen = ICallTargetErrors::AccountIsFrozen { frozenAccount: RECEIVER }.abi_encode();
         assert!(
             describe(&call_failed(0, frozen))

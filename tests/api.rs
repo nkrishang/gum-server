@@ -1573,3 +1573,113 @@ async fn pay_view_long_poll_returns_at_once_when_behind_and_at_the_deadline_othe
     assert_eq!(res.status(), 400);
     assert_eq!(res.json::<Value>().await.unwrap()["error"]["code"], "invalid_request");
 }
+
+/// The `[chains.arc]` table from `config/default.toml`, with `enabled` set as
+/// `GUM_CHAINS__ARC__ENABLED` would set it.
+fn with_arc(enabled: bool) -> impl FnOnce(&mut gum_server::config::Config) {
+    move |config| {
+        let defaults = gum_server::config::Config::load_unchecked(std::path::Path::new("config")).unwrap();
+        let mut arc = defaults.chains["arc"].clone();
+        arc.enabled = enabled;
+        config.chains.insert("arc".into(), arc);
+    }
+}
+
+const ARC_USDC: &str = "0x3600000000000000000000000000000000000000";
+
+/// Arc ships disabled: it is neither advertised nor accepted until `enabled` is set, and nothing
+/// else changes when it is.
+#[tokio::test]
+async fn arc_is_refused_until_enabled() {
+    let Some(h) = Harness::start_with(sqlx::postgres::PgPoolOptions::new().max_connections(8), with_arc(false)).await
+    else {
+        eprintln!("TEST_DATABASE_URL not set; skipping");
+        return;
+    };
+    let key = h.api_key_for("did:privy:arc-off").await;
+    let chains: Value = h.http.get(h.url("/v1/chains")).send().await.unwrap().json().await.unwrap();
+    assert_eq!(chains["chains"].as_array().unwrap().len(), 1, "{chains}");
+    assert_eq!(chains["chains"][0]["name"], "anvil");
+
+    let mut body = deposit_body();
+    body["chain_id"] = json!("arc");
+    let res = h.http.post(h.url("/v1/deposit")).bearer_auth(&key).json(&body).send().await.unwrap();
+    assert_eq!(res.status(), 400);
+    let err: Value = res.json().await.unwrap();
+    assert_eq!(err["error"]["code"], "unsupported_chain");
+    assert_eq!(err["error"]["message"], "unsupported chain \"arc\"; supported: anvil (31337)");
+
+    // Listing by a configured but disabled chain still works (its earlier deposits stay visible).
+    let res = h.http.get(h.url("/v1/deposit?chain_id=5042")).bearer_auth(&key).send().await.unwrap();
+    assert_eq!(res.status(), 200);
+}
+
+/// Once enabled, an Arc deposit is an ordinary 6-decimal USDC deposit on the ERC-20 at 0x3600…:
+/// gum-indexer is asked to watch that token in those units (it maps native USDC sends onto it), and
+/// the settlement moves the balance through it. Chain id 5042 is in the address and the engine job.
+#[tokio::test]
+async fn arc_deposit_settles_through_the_usdc_erc20() {
+    let Some(h) = Harness::start_with(sqlx::postgres::PgPoolOptions::new().max_connections(8), with_arc(true)).await
+    else {
+        eprintln!("TEST_DATABASE_URL not set; skipping");
+        return;
+    };
+    mount_upstreams(&h).await;
+    let key = h.api_key_for("did:privy:arc-on").await;
+    let chains: Value = h.http.get(h.url("/v1/chains")).send().await.unwrap().json().await.unwrap();
+    let arc = chains["chains"].as_array().unwrap().iter().find(|c| c["name"] == "arc").expect("arc listed").clone();
+    assert_eq!(arc["chain_id"], 5042);
+    assert_eq!(arc["factory"], FACTORY.to_ascii_lowercase());
+    assert_eq!(arc["tokens"], json!([{ "symbol": "USDC", "address": ARC_USDC, "decimals": 6 }]));
+
+    let mut body = deposit_body();
+    body["chain_id"] = json!(5042);
+    let res = h.http.post(h.url("/v1/deposit")).bearer_auth(&key).json(&body).send().await.unwrap();
+    assert_eq!(res.status(), 201, "{}", res.text().await.unwrap());
+    let created: Value = res.json().await.unwrap();
+    let id: Uuid = created["id"].as_str().unwrap().parse().unwrap();
+    let payment_address = created["payment_address"].as_str().unwrap().to_owned();
+    assert_eq!(
+        (&created["chain_id"], &created["token"], &created["token_address"], &created["token_decimals"]),
+        (&json!(5042), &json!("USDC"), &json!(ARC_USDC), &json!(6))
+    );
+    let usdc: Address = ARC_USDC.parse().unwrap();
+    let receiver: Address = created["receiver"].as_str().unwrap().parse().unwrap();
+    let terms = PaymentTerms {
+        token: usdc,
+        amount: U256::from(2_500_000u64),
+        calls: vec![Call::transfer(usdc, receiver, U256::from(2_500_000u64))],
+        expiration_timestamp: chrono::DateTime::parse_from_rfc3339(created["expires_at"].as_str().unwrap())
+            .unwrap()
+            .timestamp() as u64,
+        recovery: Harness::recovery(),
+        salt: created["salt"].as_str().unwrap().parse::<B256>().unwrap(),
+        chain_id: 5042,
+    };
+    assert_eq!(format!("{:#x}", terms.payment_address(FACTORY.parse().unwrap())), payment_address);
+
+    h.wait_for("watch registration", Duration::from_secs(5), || async {
+        h.indexer.received_requests().await.unwrap_or_default().into_iter().next()
+    })
+    .await;
+    let watch_body: Value = serde_json::from_slice(&h.indexer.received_requests().await.unwrap()[0].body).unwrap();
+    assert_eq!(
+        (&watch_body["chain"], &watch_body["token"], &watch_body["balance_threshold"]),
+        (&json!("5042"), &json!(ARC_USDC), &json!("2500000"))
+    );
+
+    // gum-indexer reports Arc amounts in the ERC-20's 6 decimals, native sends included.
+    let mut event = indexer_event("arc-ev-1", "threshold.reached", &payment_address, "2500000", None);
+    event["watch"]["chain_id"] = json!(5042);
+    event["watch"]["token_address"] = json!(ARC_USDC);
+    assert_eq!(h.deliver("/v1/webhooks/indexer", INDEXER_SECRET, &event).await.status(), 200);
+    assert_eq!(h.deposit_status(id).await, "paid");
+    h.wait_for("engine submission", Duration::from_secs(5), || async {
+        h.engine.received_requests().await.unwrap_or_default().into_iter().next()
+    })
+    .await;
+    let tx_body: Value = serde_json::from_slice(&h.engine.received_requests().await.unwrap()[0].body).unwrap();
+    assert_eq!(tx_body["chain_id"], 5042);
+    assert_eq!(tx_body["to"], FACTORY.to_ascii_lowercase());
+    assert_eq!(tx_body["data"], terms.execute_calldata().to_string());
+}

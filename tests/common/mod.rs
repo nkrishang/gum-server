@@ -121,6 +121,7 @@ impl Harness {
             "anvil".to_owned(),
             ChainConfig {
                 chain_id: 31337,
+                enabled: true,
                 tokens: vec![TokenConfig { symbol: "USDC".into(), address: USDC.parse().unwrap(), decimals: 6 }],
             },
         )]);

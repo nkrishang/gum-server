@@ -21,6 +21,9 @@ pub struct TokenSpec {
 pub struct ChainSpec {
     pub name: String,
     pub chain_id: u64,
+    /// Offered for new deposits. A disabled chain still resolves, so its existing deposits can be
+    /// listed and filtered, but `POST /v1/deposit` refuses it and `/v1/chains` leaves it out.
+    pub enabled: bool,
     pub tokens: Vec<TokenSpec>,
 }
 
@@ -48,6 +51,7 @@ impl Registry {
             let spec = Arc::new(ChainSpec {
                 name: name.clone(),
                 chain_id: chain.chain_id,
+                enabled: chain.enabled,
                 tokens: chain
                     .tokens
                     .iter()
@@ -68,7 +72,7 @@ impl Registry {
         self.by_id.get(&chain_id)
     }
 
-    /// Resolves a chain by id ("8453") or slug ("base").
+    /// Resolves a chain by id ("8453") or slug ("base"), enabled or not.
     pub fn chain(&self, raw: &str) -> Option<&Arc<ChainSpec>> {
         let raw = raw.trim();
         if let Ok(id) = raw.parse::<u64>() {
@@ -77,11 +81,17 @@ impl Registry {
         self.by_name.get(&raw.to_ascii_lowercase())
     }
 
+    /// The chains offered for new deposits.
     pub fn chains(&self) -> impl Iterator<Item = &Arc<ChainSpec>> {
-        self.by_id.values()
+        self.by_id.values().filter(|c| c.enabled)
     }
 
     pub fn chain_ids(&self) -> Vec<u64> {
-        self.by_id.keys().copied().collect()
+        self.chains().map(|c| c.chain_id).collect()
+    }
+
+    /// Configured but not offered yet (or any more).
+    pub fn disabled_chain_ids(&self) -> Vec<u64> {
+        self.by_id.values().filter(|c| !c.enabled).map(|c| c.chain_id).collect()
     }
 }

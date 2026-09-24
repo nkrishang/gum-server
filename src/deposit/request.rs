@@ -69,7 +69,7 @@ impl Validator<'_> {
             serde_json::Value::Number(n) if n.is_u64() => n.to_string(),
             _ => return Err(ApiError::invalid("chain_id must be a chain id or slug")),
         };
-        let chain = self.registry.chain(&chain_raw).ok_or_else(|| {
+        let chain = self.registry.chain(&chain_raw).filter(|c| c.enabled).ok_or_else(|| {
             let known: Vec<String> = self.registry.chains().map(|c| format!("{} ({})", c.name, c.chain_id)).collect();
             ApiError::new(
                 axum::http::StatusCode::BAD_REQUEST,
@@ -226,17 +226,32 @@ mod tests {
     use chrono::Duration;
     use std::collections::BTreeMap;
 
+    const ARC_USDC: Address = address!("3600000000000000000000000000000000000000");
+
     fn registry() -> Registry {
+        registry_with_arc(true)
+    }
+
+    fn registry_with_arc(arc_enabled: bool) -> Registry {
         let mut chains = BTreeMap::new();
         chains.insert(
             "base".to_owned(),
             ChainConfig {
                 chain_id: 8453,
+                enabled: true,
                 tokens: vec![TokenConfig {
                     symbol: "USDC".into(),
                     address: address!("833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"),
                     decimals: 6,
                 }],
+            },
+        );
+        chains.insert(
+            "arc".to_owned(),
+            ChainConfig {
+                chain_id: 5042,
+                enabled: arc_enabled,
+                tokens: vec![TokenConfig { symbol: "USDC".into(), address: ARC_USDC, decimals: 6 }],
             },
         );
         Registry::from_config(&chains)
@@ -282,11 +297,14 @@ mod tests {
     }
 
     fn validate(json: serde_json::Value) -> Result<NewDeposit, ApiError> {
-        let registry = registry();
+        validate_in(&registry(), json)
+    }
+
+    fn validate_in(registry: &Registry, json: serde_json::Value) -> Result<NewDeposit, ApiError> {
         let payments = payments();
         let webhooks = webhooks();
         let v = Validator {
-            registry: &registry,
+            registry,
             payments: &payments,
             webhooks: &webhooks,
             factory: address!("5FbDB2315678afecb367f032d93F642f64180aa3"),
@@ -316,6 +334,49 @@ mod tests {
         })
         .unwrap();
         assert_eq!(by_id.token_address, d.token_address);
+    }
+
+    /// Arc USDC is native (18 decimals) and ERC-20 (6 decimals) over one balance. The deposit is in
+    /// the ERC-20's terms, like any other: gum-indexer reports 6-decimal amounts against it, and the
+    /// settlement call moves the balance through it whichever way the payer sent it.
+    #[test]
+    fn arc_usdc_is_a_six_decimal_erc20_deposit() {
+        let arc = |chain: serde_json::Value, token: &str| {
+            let mut r = base_req();
+            r["chain_id"] = chain;
+            r["token"] = serde_json::json!(token);
+            validate(r).unwrap()
+        };
+        let d = arc(serde_json::json!("arc"), "usdc");
+        assert_eq!(
+            (d.chain_id, d.token_symbol.as_str(), d.token_address, d.token_decimals),
+            (5042, "USDC", ARC_USDC, 6)
+        );
+        assert_eq!(d.calls, vec![Call::transfer(ARC_USDC, d.receiver, U256::from(2_500_000u64))]);
+        let by_id = arc(serde_json::json!(5042), "0x3600000000000000000000000000000000000000");
+        assert_eq!((by_id.chain_id, by_id.token_address), (5042, ARC_USDC));
+        assert_eq!(arc(serde_json::json!("5042"), "USDC").chain_id, 5042);
+
+        let mut r = base_req();
+        r["chain_id"] = serde_json::json!("arc");
+        r["receiver"] = serde_json::json!("0x3600000000000000000000000000000000000000");
+        assert!(validate(r).is_err(), "the token itself is never a receiver");
+    }
+
+    #[test]
+    fn a_disabled_chain_is_refused_and_not_advertised() {
+        let registry = registry_with_arc(false);
+        for chain in [serde_json::json!("arc"), serde_json::json!(5042), serde_json::json!("5042")] {
+            let mut r = base_req();
+            r["chain_id"] = chain;
+            let err = validate_in(&registry, r).unwrap_err();
+            assert_eq!(err.code, "unsupported_chain");
+            assert!(err.message.ends_with("supported: base (8453)"), "{}", err.message);
+        }
+        assert!(validate_in(&registry, base_req()).is_ok());
+        // Still resolvable, so existing deposits on it can be filtered.
+        assert_eq!(registry.chain("arc").map(|c| c.chain_id), Some(5042));
+        assert_eq!((registry.chain_ids(), registry.disabled_chain_ids()), (vec![8453], vec![5042]));
     }
 
     #[test]
