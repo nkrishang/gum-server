@@ -8,11 +8,12 @@
 use alloy_primitives::{Address, U256};
 use chrono::{DateTime, Utc};
 use serde_json::{Value, json};
+use sqlx::types::Json;
 use sqlx::{AssertSqlSafe, PgConnection, PgPool, Postgres, QueryBuilder};
 use uuid::Uuid;
 
 use super::request::NewDeposit;
-use super::{DEPOSIT_COLUMNS, Deposit, DepositEvent, DepositStatus, events};
+use super::{CallView, DEPOSIT_COLUMNS, Deposit, DepositEvent, DepositStatus, events};
 
 fn hex_lower(address: Address) -> String {
     format!("{address:#x}")
@@ -63,8 +64,8 @@ pub async fn create_deposit(
     let id = Uuid::now_v7();
     let deposit: Deposit = sqlx::query_as(AssertSqlSafe(format!(
         "INSERT INTO deposits (id, user_id, chain_id, token_symbol, token_address, token_decimals, amount, receiver, \
-         recovery, salt, expires_at, payment_address, reference, webhook_url)
-         VALUES ($1, $2, $3, $4, $5, $6, CAST($7 AS numeric), $8, $9, $10, $11, $12, $13, $14)
+         calls, recovery, salt, expires_at, payment_address, reference, webhook_url)
+         VALUES ($1, $2, $3, $4, $5, $6, CAST($7 AS numeric), $8, $9, $10, $11, $12, $13, $14, $15)
          RETURNING {DEPOSIT_COLUMNS}"
     )))
     .bind(id)
@@ -75,6 +76,7 @@ pub async fn create_deposit(
     .bind(new.token_decimals as i16)
     .bind(new.amount.to_string())
     .bind(hex_lower(new.receiver))
+    .bind(Json(new.calls.iter().map(CallView::from).collect::<Vec<_>>()))
     .bind(hex_lower(new.recovery))
     .bind(format!("{:#x}", new.salt))
     .bind(new.expires_at)

@@ -8,7 +8,7 @@ use std::time::Duration;
 use alloy_primitives::{Address, B256, U256};
 use chrono::Utc;
 use common::{ADMIN_TOKEN, ENGINE_SECRET, FACTORY, Harness, INDEXER_SECRET, USDC, deposit_body};
-use gum_server::chain::payment::PaymentTerms;
+use gum_server::chain::payment::{Call, PaymentTerms};
 use gum_server::webhooks::sign;
 use serde_json::{Value, json};
 use uuid::Uuid;
@@ -60,7 +60,7 @@ fn indexer_event(id: &str, event_type: &str, payment_address: &str, confirmed: &
 
 fn settled_receipt(payment_address: &str) -> Value {
     json!({ "transactionHash": "0xe15d10f3812c0d9a6c0d30cf5e84868309e0cc28b0fd7272f03df90ca4de222c", "status": "0x1", "logs": [
-        { "address": payment_address, "topics": ["0x7823e479a1a4ebe2418874847436f8a1680c5ee5b17f38bb59dbff28e1b45552", "0x00000000000000000000000070997970c51812dc3a010c7d01b50e0d17dc79c8"], "data": "0x00000000000000000000000000000000000000000000000000000000002625a0" }
+        { "address": payment_address, "topics": ["0x7823e479a1a4ebe2418874847436f8a1680c5ee5b17f38bb59dbff28e1b45552", "0x000000000000000000000000e7f1725e7734ce288f8367e1bb143e90bb3f0512"], "data": "0x00000000000000000000000000000000000000000000000000000000002625a0" }
     ]})
 }
 
@@ -122,11 +122,17 @@ async fn full_deposit_lifecycle() {
     assert_eq!(created["token_address"], USDC.to_ascii_lowercase());
     assert_eq!(created["recovery"], "0x3c44cdddb6a900fa2b585dd299e03d12fa4293bc");
 
+    // Settlement is one call: USDC.transfer(receiver, amount).
+    let usdc: Address = USDC.parse().unwrap();
+    let receiver: Address = created["receiver"].as_str().unwrap().parse().unwrap();
+    let transfer = Call::transfer(usdc, receiver, U256::from(2_500_000u64));
+    assert_eq!(created["calls"], json!([{ "target": USDC.to_ascii_lowercase(), "data": transfer.data.to_string() }]));
+
     // The address is exactly what PaymentFactory would derive from the stored terms.
     let terms = PaymentTerms {
-        token: USDC.parse().unwrap(),
+        token: usdc,
         amount: U256::from(2_500_000u64),
-        receiver: created["receiver"].as_str().unwrap().parse().unwrap(),
+        calls: vec![transfer],
         expiration_timestamp: chrono::DateTime::parse_from_rfc3339(created["expires_at"].as_str().unwrap())
             .unwrap()
             .timestamp() as u64,
@@ -604,8 +610,13 @@ async fn settlement_failure_expiry_and_operator_retry() {
     })
     .await;
 
-    // The engine's simulation reverted: a permanent failure the app hears about.
-    let error = json!({ "code": "simulation_reverted", "message": "CREATE3.DeploymentFailed", "revert_data": "0x" });
+    // The engine's simulation reverted: a permanent failure the app hears about. Here the
+    // receiver is blacklisted by USDC, so settlement call 0 (the transfer) fails.
+    let error = json!({
+        "code": "simulation_reverted",
+        "message": "execution reverted: CallFailed(0, Blacklistable: account is blacklisted)",
+        "revert_data": "0x5c0dee5d00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000040000000000000000000000000000000000000000000000000000000000000008408c379a000000000000000000000000000000000000000000000000000000000000000200000000000000000000000000000000000000000000000000000000000000025426c61636b6c69737461626c653a206163636f756e7420697320626c61636b6c697374656400000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+    });
     let res = h
         .deliver(
             "/v1/webhooks/engine",

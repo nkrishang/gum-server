@@ -8,7 +8,7 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
 use crate::chain::Registry;
-use crate::chain::payment::PaymentTerms;
+use crate::chain::payment::{self, Call, PaymentTerms};
 use crate::config::{PaymentsConfig, WebhooksConfig};
 use crate::error::ApiError;
 use crate::webhooks::target;
@@ -44,6 +44,8 @@ pub struct NewDeposit {
     pub token_decimals: u8,
     pub amount: U256,
     pub receiver: Address,
+    /// What the payment does on settlement: `token.transfer(receiver, amount)`.
+    pub calls: Vec<Call>,
     pub recovery: Address,
     pub salt: B256,
     pub expires_at: DateTime<Utc>,
@@ -89,7 +91,10 @@ impl Validator<'_> {
         if receiver == self.recovery {
             return Err(ApiError::invalid("receiver must not be the recovery address"));
         }
-        if receiver == token.address || receiver == self.factory {
+        if receiver == token.address
+            || receiver == self.factory
+            || receiver == payment::payment_implementation(self.factory)
+        {
             return Err(ApiError::invalid("receiver must not be a contract of the payment system"));
         }
 
@@ -129,7 +134,7 @@ impl Validator<'_> {
         let terms = PaymentTerms {
             token: token.address,
             amount,
-            receiver,
+            calls: vec![Call::transfer(token.address, receiver, amount)],
             expiration_timestamp: expires_at.timestamp() as u64,
             recovery: self.recovery,
             salt,
@@ -142,10 +147,11 @@ impl Validator<'_> {
             token_decimals: token.decimals,
             amount,
             receiver,
+            payment_address: terms.payment_address(self.factory),
+            calls: terms.calls,
             recovery: self.recovery,
             salt,
             expires_at,
-            payment_address: terms.payment_address(self.factory),
             reference,
             webhook_url,
         })
@@ -296,6 +302,11 @@ mod tests {
         assert_eq!(d.token_symbol, "USDC");
         assert_eq!(d.amount, U256::from(2_500_000u64));
         assert!(!d.payment_address.is_zero());
+        assert_eq!(
+            d.calls,
+            vec![Call::transfer(d.token_address, d.receiver, d.amount)],
+            "one transfer to the receiver"
+        );
         assert_ne!(validate(base_req()).unwrap().salt, d.salt, "each deposit gets its own salt");
         let by_id = validate({
             let mut r = base_req();
@@ -346,6 +357,10 @@ mod tests {
             "all lowercase ok"
         );
         assert!(validate(with("receiver", "0x3C44CdDdB6a900fa2b585dd299e03d12FA4293BC".into())).is_err(), "recovery");
+        assert!(
+            validate(with("receiver", "0xa16E02E87b7454126E5E10d957A927A7F5B5d2be".into())).is_err(),
+            "the payment implementation"
+        );
         assert_eq!(validate(with("chain_id", "ethereum".into())).unwrap_err().code, "unsupported_chain");
         assert_eq!(validate(with("chain_id", 1.into())).unwrap_err().code, "unsupported_chain");
         assert_eq!(validate(with("token", "DAI".into())).unwrap_err().code, "unsupported_token");

@@ -7,7 +7,7 @@ Rust (axum + sqlx + Postgres), deployed on Railway.
 Every blockchain interaction is delegated: [gum-indexer](https://github.com/nkrishang/gum-indexer)
 watches the address, [gum-engine](https://github.com/nkrishang/gum-engine) executes the settlement, and
 both call back into this service. gum-server itself never opens an RPC connection, so the request path
-is a CREATE3 computation and one database transaction.
+is a CREATE2 computation and one database transaction.
 
 ```
 app ──POST /v1/deposit──▶ gum-server ──(outbox)──▶ gum-indexer  POST /v1/watches
@@ -24,15 +24,29 @@ app ──POST /v1/deposit──▶ gum-server ──(outbox)──▶ gum-index
 | `pending` | Address issued and watched. Waiting for the payer. |
 | `partial_paid` | gum-indexer saw a transfer (pending at head, or confirmed below the amount). |
 | `paid` | Confirmed total ≥ amount. `PaymentFactory.execute` submitted to gum-engine. |
-| `settled` | `Payment` deployed; the receipt carries `Settled(receiver, amount)`. Terminal. |
+| `settled` | `Payment` deployed; its settlement calls paid the receiver and the receipt carries `Settled(token, amount)`. Terminal. |
 | `failed` | Settlement failed (`failure.code` says why). Retryable by an operator. Terminal. |
 | `expired` | `expires_at` passed before the amount was paid. Anything sent later is recoverable. Terminal. |
 
-The payment address is `PaymentFactory.paymentAddress(token, amount, receiver, expirationTimestamp,
+The payment address is `PaymentFactory.paymentAddress(token, amount, calls, expirationTimestamp,
 recovery, salt, chainId)` from [gum-contracts](https://github.com/nkrishang/gum-contracts), computed
 off-chain ([`src/chain/payment.rs`](src/chain/payment.rs)) and pinned against the deployed factory by
-tests. `recovery` is always this service's own privileged address (`payments.recovery_address`); `salt`
-is random per deposit. The address commits to all seven terms, so nobody can redirect the funds.
+tests. `calls` is the ordered list of calls the payment makes on settlement; for a deposit it is the single
+call `token.transfer(receiver, amount)`, stored with the deposit and returned as `calls`. `recovery` is
+always this service's own privileged address (`payments.recovery_address`); `salt` is random per deposit.
+The address commits to all seven terms, including every call target and every byte of calldata, so
+nobody can redirect the funds.
+
+```
+terms    = abi.encode(token, amount, calls, expirationTimestamp, recovery, salt, chainId)
+initCode = Payment.creationCode ++ abi.encode(CREATE(factory, nonce = 1), terms)
+payment  = CREATE2(factory, bytes32(0), keccak256(initCode))
+```
+
+`Payment.creationCode` belongs to one contract generation and is pinned in
+[`src/chain/payment_creation_code.hex`](src/chain/payment_creation_code.hex). `payments.factory_address`
+must be a factory of that generation: pointing it at another generation derives addresses that factory
+will never deploy.
 
 ## API
 
@@ -79,7 +93,9 @@ Idempotency-Key: <≤128 chars, optional but recommended>
 ```json
 { "id": "…", "status": "pending", "payment_address": "0x…", "chain_id": 8453,
   "token": "USDC", "token_address": "0x…", "token_decimals": 6,
-  "amount": "2500000", "confirmed_amount": "0", "receiver": "0x…", "recovery": "0x…", "salt": "0x…",
+  "amount": "2500000", "confirmed_amount": "0", "receiver": "0x…",
+  "calls": [{ "target": "0x…token", "data": "0xa9059cbb…" }],   // token.transfer(receiver, amount)
+  "recovery": "0x…", "salt": "0x…",
   "reference": "0x…", "webhook_url": "…", "expires_at": "…",
   "tx_hash": null, "block_number": null, "failure": null,
   "timestamps": { "created_at": "…", "updated_at": "…", "detected_at": null, "settled_at": null, "failed_at": null, "expired_at": null } }
@@ -173,7 +189,8 @@ POST /v1/admin/outbox/{id}/requeue
   engine submission (a crash between submit and record cannot broadcast twice); indexer registration
   is idempotent on the address.
 - **Settlement is verified, not assumed.** `settled` requires the engine's receipt to contain
-  `Settled(receiver, amount)` from the payment address. A `Recovered`-only receipt (executed after
+  `Settled(token, amount)` from the payment address, which `Payment` emits only after every call
+  succeeded and together they spent exactly `amount`. A `Recovered`-only receipt (executed after
   expiry) is `failed / expired_on_chain`. Engine failures that never executed (`expired`,
   `stuck_cancelled`, `internal`) are resubmitted up to three times before the app is told.
 - **A reconciler makes webhooks an optimisation, not a dependency.** Every `reconciler.interval_secs`
@@ -254,8 +271,8 @@ The end-to-end suite starts the real server on a random port with a fresh databa
 stubs gum-indexer, gum-engine and the app webhook with wiremock. It walks the whole lifecycle
 (create → watch registered → partial_paid → paid → execute submitted → settled → app notified),
 idempotency, key rotation, pagination, ownership, signature verification, failure, automatic and
-operator retries, and expiry. The CREATE3 derivation and the `Settled` topic are pinned against
-values observed from the real contracts on Anvil.
+operator retries, and expiry. The CREATE2 derivation, the `execute` calldata and the `Settled` event
+are pinned against values observed from the real contracts on Anvil.
 
 ## Deploying
 
