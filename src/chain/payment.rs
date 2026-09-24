@@ -179,15 +179,16 @@ mod tests {
         }
     }
 
-    /// Pins the generation: gum-contracts `4ab1e5b` (PR #1, settlement calls), solc 0.8.33,
+    /// Pins the generation: gum-contracts `5eb28d6` (PR #1, settlement calls, hardened), solc 0.8.33,
     /// 1,000,000 optimizer runs, EVM prague. Any change to `Payment.sol` changes this hash, and
-    /// needs a new factory generation and a new `payment_creation_code.hex`.
+    /// needs a new factory generation and a new `payment_creation_code.hex`. The factory deployed at
+    /// `payments.factory_address` embeds exactly this code: see `matches_the_mainnet_factory`.
     #[test]
     fn creation_code_is_the_pinned_generation() {
-        assert_eq!(PAYMENT_CREATION_CODE.len(), 1895);
+        assert_eq!(PAYMENT_CREATION_CODE.len(), 2042);
         assert_eq!(
             keccak256(PAYMENT_CREATION_CODE.as_slice()),
-            b256!("4f39ceb944bf73d048a1dff309225e93ba3f3ae0935a272387916636a5e3ccc0")
+            b256!("f876e365d3c4745f0abb25ffcc7fd085b62bbd9cce612b0d6e2218aa772dd783")
         );
     }
 
@@ -199,7 +200,7 @@ mod tests {
 
         let salt_ab =
             PaymentTerms { salt: b256!("00000000000000000000000000000000000000000000000000000000000000ab"), ..terms() };
-        assert_eq!(salt_ab.payment_address(FACTORY), address!("9278095fE07F7A3B4A4a7cB37Ff47152092E4181"));
+        assert_eq!(salt_ab.payment_address(FACTORY), address!("6852C2794e4582a6468fD245bCcA3D38132B9e56"));
 
         let amount = U256::from(999_999_999_999u64);
         let other = PaymentTerms {
@@ -209,7 +210,7 @@ mod tests {
             chain_id: 8453,
             ..terms()
         };
-        assert_eq!(other.payment_address(FACTORY), address!("10f732E807688463d1b2eE09C1aFb34A5d7854Ee"));
+        assert_eq!(other.payment_address(FACTORY), address!("60B82b5e32bA5D52a4682F08a2aA60432506eC3f"));
 
         let split = PaymentTerms {
             calls: vec![
@@ -218,7 +219,34 @@ mod tests {
             ],
             ..salt_ab
         };
-        assert_eq!(split.payment_address(FACTORY), address!("89B40661586f3C05F37D876E0EaaDD4e14DF39ed"));
+        assert_eq!(split.payment_address(FACTORY), address!("C5681C787CCd19499bab010a80c66C7F74b90463"));
+    }
+
+    /// Known answers from the production factory (`payments.factory_address`), read with
+    /// `cast call <factory> "paymentAddress(...)"` on Base and Arc mainnet on 2026-09-24. The factory's
+    /// code is identical on every chain. A mismatch here means `payment_creation_code.hex` is not the
+    /// generation production deployed, and every address issued would be unsettleable.
+    #[test]
+    fn matches_the_mainnet_factory() {
+        let factory = address!("6D85B9706D8f076cB8A9fEA37d70Fcb8D22C2952");
+        assert_eq!(payment_implementation(factory), address!("bB6584608a15ce2574F2a6EaE8F2aCC59cEEa502"));
+        let on = |token: Address, chain_id: u64| {
+            let amount = U256::from(2_500_000u64);
+            PaymentTerms {
+                token,
+                amount,
+                calls: vec![Call::transfer(token, RECEIVER, amount)],
+                expiration_timestamp: 1_800_000_000,
+                recovery: address!("8093fef21c5d153456a7a39b3b09e69abc01a961"),
+                salt: b256!("0000000000000000000000000000000000000000000000000000000000000001"),
+                chain_id,
+            }
+            .payment_address(factory)
+        };
+        let base_usdc = address!("833589fCD6eDb6E08f4c7C32D4f71b54bdA02913");
+        assert_eq!(on(base_usdc, 8453), address!("2bdeD57b181534879E570AaD99131Ae37924eAF2"));
+        let arc_usdc = address!("3600000000000000000000000000000000000000");
+        assert_eq!(on(arc_usdc, 5042), address!("0B63131cF12bE3d99c75a860847e58cB0577C1aF"));
     }
 
     #[test]
@@ -276,14 +304,14 @@ mod tests {
         // The receipt of a real `execute` on Anvil: the payment was funded with 0.1 USDC too much,
         // so it forwards the excess to recovery, runs its one transfer, then settles.
         let logs: Vec<ReceiptLog> = serde_json::from_str(
-            r#"[{"address":"0xe7f1725e7734ce288f8367e1bb143e90bb3f0512","topics":["0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef","0x000000000000000000000000aff4cd731512fecba987d8fd35f9c7469afa90c7","0x0000000000000000000000003c44cdddb6a900fa2b585dd299e03d12fa4293bc"],"data":"0x00000000000000000000000000000000000000000000000000000000000186a0","blockNumber":"0x5","logIndex":"0x0","removed":false},
-               {"address":"0xaff4cd731512fecba987d8fd35f9c7469afa90c7","topics":["0xfff3b3844276f57024e0b42afec1a37f75db36511e43819a4f2a63ab7862b648","0x0000000000000000000000003c44cdddb6a900fa2b585dd299e03d12fa4293bc","0x000000000000000000000000e7f1725e7734ce288f8367e1bb143e90bb3f0512"],"data":"0x00000000000000000000000000000000000000000000000000000000000186a0","blockNumber":"0x5","logIndex":"0x1","removed":false},
-               {"address":"0xe7f1725e7734ce288f8367e1bb143e90bb3f0512","topics":["0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef","0x000000000000000000000000aff4cd731512fecba987d8fd35f9c7469afa90c7","0x00000000000000000000000070997970c51812dc3a010c7d01b50e0d17dc79c8"],"data":"0x00000000000000000000000000000000000000000000000000000000002625a0","blockNumber":"0x5","logIndex":"0x2","removed":false},
-               {"address":"0xaff4cd731512fecba987d8fd35f9c7469afa90c7","topics":["0x74a5b5c63602662a2c967556916428411d055eeb47c4d96e6325304cb5603a99","0x0000000000000000000000000000000000000000000000000000000000000000","0x000000000000000000000000e7f1725e7734ce288f8367e1bb143e90bb3f0512"],"data":"0x000000000000000000000000000000000000000000000000000000000000004000000000000000000000000000000000000000000000000000000000000000c00000000000000000000000000000000000000000000000000000000000000044a9059cbb00000000000000000000000070997970c51812dc3a010c7d01b50e0d17dc79c800000000000000000000000000000000000000000000000000000000002625a00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000200000000000000000000000000000000000000000000000000000000000000001","blockNumber":"0x5","logIndex":"0x3","removed":false},
-               {"address":"0xaff4cd731512fecba987d8fd35f9c7469afa90c7","topics":["0x7823e479a1a4ebe2418874847436f8a1680c5ee5b17f38bb59dbff28e1b45552","0x000000000000000000000000e7f1725e7734ce288f8367e1bb143e90bb3f0512"],"data":"0x00000000000000000000000000000000000000000000000000000000002625a0","blockNumber":"0x5","logIndex":"0x4","removed":false}]"#,
+            r#"[{"address":"0xe7f1725e7734ce288f8367e1bb143e90bb3f0512","topics":["0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef","0x0000000000000000000000003224a662f3c08f1f3472a587bb12de67ca365053","0x0000000000000000000000003c44cdddb6a900fa2b585dd299e03d12fa4293bc"],"data":"0x00000000000000000000000000000000000000000000000000000000000186a0","blockNumber":"0x4","logIndex":"0x0","removed":false},
+               {"address":"0x3224a662f3c08f1f3472a587bb12de67ca365053","topics":["0xfff3b3844276f57024e0b42afec1a37f75db36511e43819a4f2a63ab7862b648","0x0000000000000000000000003c44cdddb6a900fa2b585dd299e03d12fa4293bc","0x000000000000000000000000e7f1725e7734ce288f8367e1bb143e90bb3f0512"],"data":"0x00000000000000000000000000000000000000000000000000000000000186a0","blockNumber":"0x4","logIndex":"0x1","removed":false},
+               {"address":"0xe7f1725e7734ce288f8367e1bb143e90bb3f0512","topics":["0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef","0x0000000000000000000000003224a662f3c08f1f3472a587bb12de67ca365053","0x00000000000000000000000070997970c51812dc3a010c7d01b50e0d17dc79c8"],"data":"0x00000000000000000000000000000000000000000000000000000000002625a0","blockNumber":"0x4","logIndex":"0x2","removed":false},
+               {"address":"0x3224a662f3c08f1f3472a587bb12de67ca365053","topics":["0x74a5b5c63602662a2c967556916428411d055eeb47c4d96e6325304cb5603a99","0x0000000000000000000000000000000000000000000000000000000000000000","0x000000000000000000000000e7f1725e7734ce288f8367e1bb143e90bb3f0512"],"data":"0x000000000000000000000000000000000000000000000000000000000000004000000000000000000000000000000000000000000000000000000000000000c00000000000000000000000000000000000000000000000000000000000000044a9059cbb00000000000000000000000070997970c51812dc3a010c7d01b50e0d17dc79c800000000000000000000000000000000000000000000000000000000002625a00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000200000000000000000000000000000000000000000000000000000000000000001","blockNumber":"0x4","logIndex":"0x3","removed":false},
+               {"address":"0x3224a662f3c08f1f3472a587bb12de67ca365053","topics":["0x7823e479a1a4ebe2418874847436f8a1680c5ee5b17f38bb59dbff28e1b45552","0x000000000000000000000000e7f1725e7734ce288f8367e1bb143e90bb3f0512"],"data":"0x00000000000000000000000000000000000000000000000000000000002625a0","blockNumber":"0x4","logIndex":"0x4","removed":false}]"#,
         )
         .unwrap();
-        let payment = address!("aff4cd731512fecba987d8fd35f9c7469afa90c7");
+        let payment = address!("3224a662f3c08f1f3472a587bb12de67ca365053");
         let salt_cd = b256!("00000000000000000000000000000000000000000000000000000000000000cd");
         assert_eq!(PaymentTerms { salt: salt_cd, ..terms() }.payment_address(FACTORY), payment);
         assert_eq!(execution_outcome(&logs, payment), ExecutionOutcome::Settled);
