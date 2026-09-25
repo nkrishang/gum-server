@@ -17,6 +17,7 @@ const USDC_ARB: &str = "0xaf88d065e77c8cc2239327c5edb3a432268e5831";
 const DEPOSITORY: &str = "0x4cd00e387622c35bddb9b4c962c136462338bc31";
 const REQUEST: &str = "0x1790248938255ff5c9db51e367a55380edb458572f010bc52415d45da935ffd5";
 const NATIVE: &str = "0x0000000000000000000000000000000000000000";
+const ARB: &str = "0x912ce59144191c1204e64559fe8253a0e49e6548";
 
 async fn harness_with(tweak: impl FnOnce(&mut gum_server::config::Config)) -> Option<Harness> {
     Harness::start_with(sqlx::postgres::PgPoolOptions::new().max_connections(8), tweak).await
@@ -65,6 +66,13 @@ async fn mount_chains(h: &Harness, anvil_receives: bool) {
         let mut c = chain(42161, "Arbitrum", true);
         c["featuredTokens"] = json!([{ "symbol": "USDC", "name": "USD Coin", "address": USDC_ARB, "decimals": 6,
                                        "metadata": { "logoURI": "https://example.com/usdc.png" } }]);
+        // ARB is a solver currency in this mock, but not one that routes in one step (not on the
+        // checked list), so it is never offered or quoted.
+        c["solverCurrencies"] = json!([
+            { "symbol": "USDC", "name": "USD Coin", "address": USDC_ARB, "decimals": 6 },
+            { "symbol": "ARB", "name": "Arbitrum", "address": ARB, "decimals": 18 },
+            { "symbol": "ETH", "name": "Ether", "address": NATIVE, "decimals": 18 }
+        ]);
         c
     };
     let solana = json!({ "id": 792703809, "name": "solana", "displayName": "Solana", "vmType": "svm", "httpRpcUrl": "https://sol.example" });
@@ -211,6 +219,12 @@ async fn a_route_is_pinned_to_the_deposit_and_checked_before_the_payer_sees_it()
             json!({ "user": NATIVE, "origin_chain_id": 42161, "origin_currency": NATIVE, "amount": "1" }),
             400,
             "invalid_request",
+        ),
+        // A solver currency that doesn't route in one step (not on the checked list).
+        (
+            json!({ "user": PAYER, "origin_chain_id": 42161, "origin_currency": ARB, "amount": "1" }),
+            400,
+            "unsupported_token",
         ),
         (
             json!({ "user": PAYER, "origin_chain_id": 42161, "origin_currency": NATIVE, "amount": "1", "recipient": PAYER }),
@@ -456,4 +470,91 @@ async fn relay_live_quotes_pass_the_checks() {
             tokio::time::sleep(Duration::from_millis(300)).await;
         }
     }
+}
+
+/// Keeps `relay_tokens::DIRECT_TOKENS` true: quotes every solver currency Relay lists on every EVM
+/// chain it routes from into a Base USDC deposit, through every check, and compares with the list.
+/// Fails, with the lines to paste, when a listed token no longer passes the checks or an unlisted
+/// one now does. Relay's own refusals (no route, no liquidity) are reported, not failed: they come
+/// and go with liquidity. Takes a few minutes: quotes are paced under Relay's 50 a minute.
+#[tokio::test]
+#[ignore = "calls api.relay.link for every solver currency; needs RELAY_API_KEY"]
+async fn relay_live_direct_tokens() {
+    use gum_server::deposit::relay_tokens::{DIRECT_TOKENS, is_direct};
+    let h = harness!(|c| {
+        live(c);
+        c.relay.probe_unlisted_tokens = true;
+        c.relay.quotes_per_minute = 1_000;
+        c.relay.quotes_per_deposit_per_minute = 1_000;
+        c.relay.reads_per_minute = 1_000;
+    });
+    let mut body = deposit_body();
+    body["chain_id"] = json!("base");
+    body["amount"] = json!("5000000");
+    let deposit = create_deposit(&h, body).await;
+    let id = deposit["id"].as_str().unwrap();
+    let base_usdc = deposit["token_address"].as_str().unwrap().to_owned();
+
+    let chains = h.state.relay.chains().await.expect("relay chains");
+    let (mut routes, mut rejected, mut relay_refused) = (vec![], vec![], vec![]);
+    for c in chains.iter().filter(|c| c.vm_type == "evm" && !c.disabled) {
+        for t in &c.solver_currencies {
+            let address = t.address.to_ascii_lowercase();
+            if c.id == 8453 && address == base_usdc {
+                routes.push((c.id, address, t.symbol.clone(), c.display_name.clone()));
+                continue;
+            }
+            let quote =
+                json!({ "user": PAYER, "origin_chain_id": c.id, "origin_currency": address, "amount": "5000000" });
+            let res = h
+                .http
+                .post(h.url(&format!("/v1/pay/{id}/quote")))
+                .json(&quote)
+                .timeout(Duration::from_secs(30))
+                .send()
+                .await
+                .unwrap();
+            let status = res.status().as_u16();
+            let code = res.json::<Value>().await.ok().and_then(|b| b["error"]["code"].as_str().map(str::to_owned));
+            let entry = (c.id, address, t.symbol.clone(), c.display_name.clone());
+            match status {
+                200 => routes.push(entry),
+                422 => relay_refused.push((entry, code.unwrap_or_default())),
+                _ => rejected.push((entry, format!("{status} {}", code.unwrap_or_default()))),
+            }
+            tokio::time::sleep(Duration::from_millis(1_300)).await;
+        }
+    }
+    let add: Vec<_> = routes.iter().filter(|(chain, address, ..)| !is_direct(*chain, address)).collect();
+    let remove: Vec<_> = rejected.iter().filter(|((chain, address, ..), _)| is_direct(*chain, address)).collect();
+    eprintln!(
+        "{} route in one step, {} rejected (two-step), {} refused by Relay",
+        routes.len(),
+        rejected.len(),
+        relay_refused.len()
+    );
+    for ((_, _, symbol, chain), why) in &relay_refused {
+        eprintln!("  Relay refused {symbol} on {chain}: {why}");
+    }
+    for (chain_id, address, symbol, chain) in &add {
+        eprintln!(
+            "  ADD ({chain}): DirectToken {{ chain_id: {chain_id}, address: \"{address}\", symbol: \"{symbol}\" }},"
+        );
+    }
+    for ((chain_id, address, symbol, chain), why) in &remove {
+        eprintln!("  REMOVE {symbol} on {chain} ({chain_id}, {address}): {why}");
+    }
+    let listed_gone: Vec<_> = DIRECT_TOKENS
+        .iter()
+        .filter(|t| {
+            !chains.iter().any(|c| {
+                c.id == t.chain_id && c.solver_currencies.iter().any(|s| s.address.eq_ignore_ascii_case(t.address))
+            })
+        })
+        .map(|t| format!("{} on {}", t.symbol, t.chain_id))
+        .collect();
+    if !listed_gone.is_empty() {
+        eprintln!("  no longer solver currencies (hidden already; remove when convenient): {listed_gone:?}");
+    }
+    assert!(add.is_empty() && remove.is_empty(), "relay_tokens::DIRECT_TOKENS is out of date; see above");
 }
