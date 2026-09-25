@@ -275,6 +275,13 @@ minute; a route's status for 2 s), and what misses the caches counts against
 (60) of prices, searches and statuses. Run more than one replica, or expect more payers, and ask
 Relay for higher limits.
 
+**What a payer can pay with.** Only tokens Relay's solver takes as they are, on each chain, and that
+route in one step: 104 tokens across 50 EVM chains as of 2026-09-25 (native coins, the major
+stablecoins, cbBTC, APE, HYPE, …). The exact list, with addresses, is in
+[docs/relay-tokens.md](docs/relay-tokens.md) and [`src/deposit/relay_tokens.rs`](src/deposit/relay_tokens.rs).
+Anything else would first be swapped on the payer's chain (a two-step route), which isn't offered:
+`/sources` and search leave it out, and a quote for it is `400 unsupported_token`.
+
 The deposit itself knows nothing of Relay: the fill is an ordinary transfer of the deposit's token
 to the payment address from Relay's solver, which gum-indexer detects and gum-engine settles like
 any other. `cargo test --test relay -- --ignored` runs live quotes against api.relay.link for every

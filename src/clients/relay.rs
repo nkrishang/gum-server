@@ -83,6 +83,10 @@ pub struct RelayChain {
     pub featured_tokens: Vec<RelayChainCurrency>,
     #[serde(default)]
     pub erc20_currencies: Vec<RelayChainCurrency>,
+    /// What Relay's solver takes on this chain as it is. Anything else is swapped into one of
+    /// these first, a two-step route this service doesn't offer (see `deposit::relay_tokens`).
+    #[serde(default)]
+    pub solver_currencies: Vec<RelayChainCurrency>,
     #[serde(default)]
     pub contracts: Option<RelayContracts>,
     #[serde(default)]
@@ -147,6 +151,10 @@ pub struct RelayProtocol {
 pub struct RelayProtocolV2 {
     #[serde(default)]
     pub depository: Option<String>,
+    /// How Relay's signed orders name this chain (`worldchain` for `world-chain`, `manta` for
+    /// `manta-pacific`), which is not always its `name`.
+    #[serde(default, rename = "chainId")]
+    pub chain_id: Option<String>,
 }
 
 /// Relay's contracts on one chain, by role. The roles matter: a public router runs anyone's calls,

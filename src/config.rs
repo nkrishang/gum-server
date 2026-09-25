@@ -162,6 +162,11 @@ pub struct RelayConfig {
     pub reads_per_minute: u32,
     /// Token searches, prices and route statuses a minute for one deposit.
     pub reads_per_deposit_per_minute: u32,
+    /// Quote any of Relay's solver currencies, not only the checked list
+    /// (`deposit::relay_tokens`). For the probe that maintains that list; every check on the
+    /// route still applies. Off in every deployment.
+    #[serde(default)]
+    pub probe_unlisted_tokens: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

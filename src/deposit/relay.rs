@@ -38,7 +38,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
 
-use super::{Deposit, DepositStatus, store};
+use super::{Deposit, DepositStatus, relay_tokens, store};
 use crate::clients::UpstreamError;
 use crate::clients::relay::{
     Quote, QuoteAmount, QuoteRequest, RelayChain, RelayChainCurrency, RelayMetadata, RelayRoles,
@@ -142,7 +142,10 @@ pub struct SourceChain {
     pub rpc_url: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub multicall3: Option<String>,
+    /// The chain's native currency: always described (it pays for gas), but only offered to pay
+    /// with when `native_payable`.
     pub native: SourceToken,
+    pub native_payable: bool,
     /// The ERC-20 that is the same balance as the native currency, when there is one (Arc).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub native_alias: Option<String>,
@@ -198,14 +201,23 @@ fn source_chain(c: &RelayChain, deposit: &Deposit) -> SourceChain {
         native.logo_uri =
             c.featured_tokens.iter().find(|t| t.address.eq_ignore_ascii_case(NATIVE)).and_then(|t| logo(&t.metadata));
     }
+    // Only what Relay's solver takes as it is, and only what has been checked to route in one
+    // step (`relay_tokens`). The featured entry, when there is one, brings the logo.
+    let featured_logo = |address: &str| {
+        c.featured_tokens.iter().find(|t| t.address.eq_ignore_ascii_case(address)).and_then(|t| logo(&t.metadata))
+    };
     let mut seen = BTreeSet::from([NATIVE.to_owned()]);
     let mut tokens: Vec<SourceToken> = c
-        .featured_tokens
+        .solver_currencies
         .iter()
-        .chain(&c.erc20_currencies)
+        .filter(|t| relay_tokens::is_direct(c.id, &t.address))
         .filter(|t| seen.insert(t.address.to_ascii_lowercase()))
-        .map(SourceToken::of)
+        .map(|t| SourceToken {
+            logo_uri: logo(&t.metadata).or_else(|| featured_logo(&t.address)),
+            ..SourceToken::of(t)
+        })
         .collect();
+    let native_payable = pays_directly(c, NATIVE);
     // The deposit's own token is always listed on its chain, whatever Relay features.
     if c.id as i64 == deposit.chain_id && seen.insert(deposit.token_address.clone()) {
         tokens.insert(
@@ -231,9 +243,17 @@ fn source_chain(c: &RelayChain, deposit: &Deposit) -> SourceChain {
             .and_then(|k| k.multicall3.clone())
             .filter(|a| a.parse::<Address>().is_ok_and(|a| !a.is_zero())),
         native,
+        native_payable,
         native_alias,
         tokens,
     }
+}
+
+/// Relay's solver takes this token on this chain as it is, and it has been checked to route in one
+/// step. Only these are offered, searched and quoted.
+fn pays_directly(c: &RelayChain, address: &str) -> bool {
+    relay_tokens::is_direct(c.id, address)
+        && c.solver_currencies.iter().any(|t| t.address.eq_ignore_ascii_case(address))
 }
 
 /// Logos for the tokens Relay's chain list leaves without one (its non-featured ERC-20s, a few
@@ -283,8 +303,13 @@ pub async fn sources(State(state): State<AppState>, Path(id): Path<String>) -> R
         if !can_receive(&chains, deposit.chain_id as u64) {
             unavailable("destination_unsupported")
         } else {
-            let mut list: Vec<SourceChain> =
-                chains.iter().filter(|c| usable(c)).map(|c| source_chain(c, &deposit)).collect();
+            // Chains with nothing to pay with directly are left out: nothing there to scan.
+            let mut list: Vec<SourceChain> = chains
+                .iter()
+                .filter(|c| usable(c))
+                .map(|c| source_chain(c, &deposit))
+                .filter(|c| c.id as i64 == deposit.chain_id || c.native_payable || !c.tokens.is_empty())
+                .collect();
             // The deposit's chain first; the rest as Relay orders them.
             list.sort_by_key(|c| c.id as i64 != deposit.chain_id);
             fill_logos(&state, &mut list).await;
@@ -343,6 +368,7 @@ pub async fn search_tokens(
         .iter()
         .filter(|c| c.vm_type.is_empty() || c.vm_type == "evm")
         .filter(|c| usable_ids.contains(&c.chain_id) && c.address.parse::<Address>().is_ok())
+        .filter(|found| chains.iter().any(|c| c.id == found.chain_id && pays_directly(c, &found.address)))
         .map(|c| FoundToken {
             chain_id: c.chain_id,
             token: SourceToken {
@@ -523,6 +549,16 @@ pub async fn quote(
             "Relay does not route from this chain",
         ));
     };
+    let origin_currency = format!("{:#x}", expected.origin_currency);
+    let probing = state.config.relay.probe_unlisted_tokens
+        && origin.solver_currencies.iter().any(|t| t.address.eq_ignore_ascii_case(&origin_currency));
+    if !probing && !pays_directly(origin, &origin_currency) {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "unsupported_token",
+            "that token can't pay this directly; pick one from the list",
+        ));
+    }
     expected.relay_roles = origin.relay_roles();
     expected.origin_chain_names = chain_names(origin);
     expected.destination_chain_names =
@@ -635,6 +671,11 @@ fn chain_names(c: &RelayChain) -> Vec<String> {
     if !c.display_name.is_empty() {
         names.push(c.display_name.to_ascii_lowercase());
     }
+    // The name Relay's signed orders use for the chain, which can differ from both (World Chain
+    // is `world-chain` in the list and `worldchain` in its orders).
+    if let Some(order_name) = c.protocol.as_ref().and_then(|p| p.v2.as_ref()).and_then(|v2| v2.chain_id.as_deref()) {
+        names.push(order_name.to_ascii_lowercase());
+    }
     names.sort();
     names.dedup();
     names
@@ -652,6 +693,7 @@ fn chain_token_decimals(c: &RelayChain, currency: Address) -> Option<u8> {
     c.featured_tokens
         .iter()
         .chain(&c.erc20_currencies)
+        .chain(&c.solver_currencies)
         .find(|t| t.address.eq_ignore_ascii_case(&raw))
         .map(|t| t.decimals)
 }
@@ -2134,6 +2176,8 @@ mod tests {
             "currency": { "symbol": "USDC", "name": "USD Coin (Gas Currency)", "address": NATIVE, "decimals": 18 },
             "featuredTokens": [{ "symbol": "USDC", "name": "USD Coin", "address": "0x3600000000000000000000000000000000000000", "decimals": 6 }],
             "erc20Currencies": [{ "symbol": "USDC", "name": "USD Coin", "address": "0x3600000000000000000000000000000000000000", "decimals": 6 }],
+            "solverCurrencies": [{ "symbol": "USDC", "name": "USD Coin", "address": "0x3600000000000000000000000000000000000000", "decimals": 6 },
+                                 { "symbol": "USDC", "name": "USD Coin (Gas Currency)", "address": NATIVE, "decimals": 18 }],
             "contracts": { "multicall3": "" }
         }))
         .unwrap();
@@ -2146,19 +2190,46 @@ mod tests {
     }
 
     #[test]
-    fn the_deposit_token_is_always_listed_on_its_chain() {
+    fn only_tokens_that_route_in_one_step_are_offered() {
+        const USDC_MONAD: &str = "0x754704bc059f8c67012fed69bc8a327a5aafb603";
+        const JUNK: &str = "0x00000000000000000000000000000000000000aa";
         let chain: RelayChain = serde_json::from_value(json!({
             "id": 143, "name": "monad", "displayName": "Monad", "vmType": "evm", "httpRpcUrl": "https://rpc3.monad.xyz",
             "currency": { "symbol": "MON", "name": "Monad", "address": NATIVE, "decimals": 18 },
-            "featuredTokens": [{ "symbol": "USDC", "address": "0x754704bc059f8c67012fed69bc8a327a5aafb603", "decimals": 6 }]
+            "featuredTokens": [
+                { "symbol": "USDC", "address": USDC_MONAD, "decimals": 6, "metadata": { "logoURI": "https://example.com/usdc.png" } },
+                { "symbol": "FEAT", "address": "0x00000000000000000000000000000000000000bb", "decimals": 18 }
+            ],
+            "solverCurrencies": [
+                { "symbol": "USDC", "address": USDC_MONAD, "decimals": 6 },
+                { "symbol": "JUNK", "address": JUNK, "decimals": 18 },
+                { "symbol": "MON", "address": NATIVE, "decimals": 18 }
+            ]
         }))
         .unwrap();
-        let source = source_chain(&chain, &test_deposit(143, "0x00000000efe302beaa2b3e6e1b18d08d69a9012a"));
-        let symbols: Vec<_> = source.tokens.iter().map(|t| t.address.as_str()).collect();
+        // The deposit's own token is listed on its chain whatever Relay says; of the rest, only
+        // solver currencies on the checked list (not JUNK, not a merely featured token).
+        let deposit_token = "0x00000000000000000000000000000000000000cc";
+        let source = source_chain(&chain, &test_deposit(143, deposit_token));
+        let listed: Vec<_> = source.tokens.iter().map(|t| t.address.as_str()).collect();
+        assert_eq!(listed, [deposit_token, USDC_MONAD]);
         assert_eq!(
-            symbols,
-            ["0x00000000efe302beaa2b3e6e1b18d08d69a9012a", "0x754704bc059f8c67012fed69bc8a327a5aafb603"]
+            source.tokens[1].logo_uri.as_deref(),
+            Some("https://example.com/usdc.png"),
+            "logo from the featured entry"
         );
+        assert!(source.native_payable, "MON is on the list");
+
+        // A native currency Relay wraps before routing (ETH on Soneium) is described, not offered.
+        let soneium: RelayChain = serde_json::from_value(json!({
+            "id": 1868, "name": "soneium", "vmType": "evm", "httpRpcUrl": "https://rpc.soneium.org",
+            "currency": { "symbol": "ETH", "name": "Ether", "address": NATIVE, "decimals": 18 },
+            "solverCurrencies": [{ "symbol": "ETH", "address": NATIVE, "decimals": 18 }]
+        }))
+        .unwrap();
+        let source = source_chain(&soneium, &test_deposit(8453, USDC_BASE));
+        assert!(!source.native_payable && source.tokens.is_empty());
+        assert_eq!(source.native.symbol, "ETH");
     }
 
     fn test_deposit(chain_id: i64, token: &str) -> Deposit {
