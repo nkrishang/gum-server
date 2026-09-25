@@ -186,13 +186,18 @@ fn can_receive(chains: &[RelayChain], chain_id: u64) -> bool {
 
 fn source_chain(c: &RelayChain, deposit: &Deposit) -> SourceChain {
     let native_alias = NATIVE_ALIASES.iter().find(|(id, _)| *id == c.id).map(|(_, token)| (*token).to_owned());
-    let native = c.currency.as_ref().map(SourceToken::of).unwrap_or_else(|| SourceToken {
+    let mut native = c.currency.as_ref().map(SourceToken::of).unwrap_or_else(|| SourceToken {
         address: NATIVE.into(),
         symbol: "ETH".into(),
         name: "Ether".into(),
         decimals: 18,
         logo_uri: None,
     });
+    // The chain's `currency` carries no logo; its featured entry at the zero address usually does.
+    if native.logo_uri.is_none() {
+        native.logo_uri =
+            c.featured_tokens.iter().find(|t| t.address.eq_ignore_ascii_case(NATIVE)).and_then(|t| logo(&t.metadata));
+    }
     let mut seen = BTreeSet::from([NATIVE.to_owned()]);
     let mut tokens: Vec<SourceToken> = c
         .featured_tokens
@@ -231,6 +236,31 @@ fn source_chain(c: &RelayChain, deposit: &Deposit) -> SourceChain {
     }
 }
 
+/// Logos for the tokens Relay's chain list leaves without one (its non-featured ERC-20s, a few
+/// natives), from its token lookup. Cached for hours in the client; a lookup that fails leaves
+/// them without, and the page draws the symbol instead.
+async fn fill_logos(state: &AppState, chains: &mut [SourceChain]) {
+    let key = |chain: u64, t: &SourceToken| format!("{chain}:{}", t.address);
+    let missing: Vec<String> = chains
+        .iter()
+        .flat_map(|c| {
+            std::iter::once(&c.native).chain(&c.tokens).filter(|t| t.logo_uri.is_none()).map(|t| key(c.id, t))
+        })
+        .collect();
+    if missing.is_empty() {
+        return;
+    }
+    let found = state.relay.logos(&missing).await;
+    for c in chains.iter_mut() {
+        let id = c.id;
+        for t in std::iter::once(&mut c.native).chain(c.tokens.iter_mut()) {
+            if t.logo_uri.is_none() {
+                t.logo_uri = found.get(&key(id, t)).cloned().filter(|u| u.starts_with("https://"));
+            }
+        }
+    }
+}
+
 async fn open_deposit(state: &AppState, id: &str) -> Result<Deposit, ApiError> {
     let id: Uuid = id.parse().map_err(|_| super::pay::no_such_deposit())?;
     store::get(&state.pool, id).await?.ok_or_else(super::pay::no_such_deposit)
@@ -257,6 +287,7 @@ pub async fn sources(State(state): State<AppState>, Path(id): Path<String>) -> R
                 chains.iter().filter(|c| usable(c)).map(|c| source_chain(c, &deposit)).collect();
             // The deposit's chain first; the rest as Relay orders them.
             list.sort_by_key(|c| c.id as i64 != deposit.chain_id);
+            fill_logos(&state, &mut list).await;
             Sources { available: true, reason: None, chains: list }
         }
     };

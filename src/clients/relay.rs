@@ -34,6 +34,8 @@ pub struct RelayClient {
     searches: Cache<String, Arc<Vec<RelayCurrency>>>,
     prices: Cache<String, Option<f64>>,
     statuses: Cache<String, IntentStatus>,
+    /// Token logos by `<chain id>:<address>` (None: Relay has none). Logos don't change.
+    logos: Cache<String, Option<String>>,
     /// Every call but quotes (which have their own budget in `deposit::relay`) shares Relay's
     /// per-key limit for "other" endpoints; this keeps the replica under it.
     reads: RateLimiter<NotKeyed, InMemoryState, DefaultClock>,
@@ -414,6 +416,7 @@ impl RelayClient {
             searches: Cache::builder().max_capacity(2_000).time_to_live(Duration::from_secs(60)).build(),
             prices: Cache::builder().max_capacity(5_000).time_to_live(Duration::from_secs(60)).build(),
             statuses: Cache::builder().max_capacity(10_000).time_to_live(STATUS_TTL).build(),
+            logos: Cache::builder().max_capacity(20_000).time_to_live(Duration::from_secs(6 * 3600)).build(),
             reads: RateLimiter::direct(Quota::per_minute(
                 NonZeroU32::new(cfg.reads_per_minute.max(1)).expect("at least 1"),
             )),
@@ -497,6 +500,46 @@ impl RelayClient {
         let found = Arc::new(found);
         self.searches.insert(key, found.clone());
         Ok(found)
+    }
+
+    /// Logos for `keys` (`<chain id>:<address>`, lowercase), looked up in batches through
+    /// `/currencies/v2`'s exact `tokens` filter and cached. Best effort: a failed batch is left out
+    /// (and asked again next time).
+    pub async fn logos(&self, keys: &[String]) -> std::collections::HashMap<String, String> {
+        let mut out = std::collections::HashMap::new();
+        let mut missing = Vec::new();
+        for key in keys {
+            match self.logos.get(key) {
+                Some(Some(url)) => {
+                    out.insert(key.clone(), url);
+                }
+                Some(None) => {}
+                None => missing.push(key.clone()),
+            }
+        }
+        for batch in missing.chunks(50) {
+            let body = serde_json::json!({ "tokens": batch, "limit": batch.len() });
+            let Ok(url) = self.url("/currencies/v2") else { break };
+            let found: Vec<RelayCurrency> = match self.send("logos", self.http.post(url).json(&body)).await {
+                Ok(found) => found,
+                Err(err) => {
+                    tracing::info!(error = %err, "relay token logos unavailable");
+                    continue;
+                }
+            };
+            for key in batch {
+                let logo = found
+                    .iter()
+                    .find(|c| key == &format!("{}:{}", c.chain_id, c.address.to_ascii_lowercase()))
+                    .and_then(|c| c.metadata.as_ref())
+                    .and_then(|m| m.logo_uri.clone());
+                if let Some(url) = &logo {
+                    out.insert(key.clone(), url.clone());
+                }
+                self.logos.insert(key.clone(), logo);
+            }
+        }
+        out
     }
 
     /// The token's USD price, or `None` when Relay has none. Cached per token for a minute.
