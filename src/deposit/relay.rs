@@ -716,15 +716,24 @@ pub fn check_quote(quote: &Quote, want: &Expected) -> Result<RouteQuote, String>
 
     let mut spend = Spend::default();
     let mut steps = Vec::new();
+    let mut funded = false;
     for step in &quote.steps {
         if step.kind != "transaction" {
             return Err(format!("step {} is a {} step; only transactions are supported", step.id, step.kind));
         }
         for item in &step.items {
+            if funded {
+                return Err(format!(
+                    "step {} comes after the payment is funded; a route must end at its funding transaction, so \
+                     the wallet owns the payment as soon as one transaction has gone out",
+                    step.id
+                ));
+            }
             steps.push(check_step(&step.id, &step.description, &item.data, want, input_amount, &mut spend)?);
+            funded = !is_approval(&item.data, want);
         }
     }
-    if steps.is_empty() {
+    if !funded {
         return Err("no steps to execute".into());
     }
     // The value the wallet sends is the price on screen: nothing for a token, at most the quoted
@@ -1213,10 +1222,10 @@ fn check_relay_call(call: &WalletCall, route: &Route, mut spend: Option<&mut Spe
                 )));
             }
         }
-        // The receiver only forwards the transaction's value to Relay's solver; the value is
-        // bounded with the rest of the route's.
+        // The receiver only forwards the transaction's value to Relay's solver; whatever bytes come
+        // along are emitted, not run — but they must at least decode, so nothing unread slips by.
+        // The value is bounded with the rest of the route's.
         FORWARD => {
-            // Its argument is the multicall to run, so it must at least decode.
             let mut r = Abi::new(args);
             r.bytes().ok_or_else(|| refuse("has malformed forward arguments".into()))?;
         }
@@ -1308,6 +1317,27 @@ fn check_nested_call(
         return Ok(());
     }
     Err(refuse(format!("nests a call to {target:#x}, which is neither Relay's nor the payer's token")))
+}
+
+/// Is this step's transaction only an approval on the payer's token? Read from the transaction
+/// itself — target and selector — not from Relay's step id or description. Everything else a step
+/// may legally do funds the payment: a token transfer to the depository, or a call on one of
+/// Relay's contracts.
+fn is_approval(data: &Value, want: &Expected) -> bool {
+    if want.origin_currency.is_zero() {
+        return false; // The native currency has no approvals to make.
+    }
+    let to = data.get("to").and_then(Value::as_str).and_then(|s| s.parse::<Address>().ok());
+    let selector = data
+        .get("data")
+        .and_then(Value::as_str)
+        .and_then(|c| c.strip_prefix("0x"))
+        .filter(|c| c.len() >= 8)
+        .and_then(|c| hex::decode(&c[..8]).ok());
+    match (to, selector) {
+        (Some(to), Some(selector)) => to == want.origin_currency && selector == APPROVE,
+        _ => false,
+    }
 }
 
 fn check_step(
@@ -1744,7 +1774,41 @@ mod tests {
                 q["steps"][1]["items"][0]["data"]["data"] = json!(transfer(DEPOSITORY, 2_526_643));
                 q["steps"][1]["items"][0]["data"]["to"] = json!(USDC_ARB);
             },
+            // Ordering is refused before the totals are even summed: two fundings can never both
+            // run, whatever they add up to.
+            "comes after the payment is funded",
+        );
+        // With the ordering legal, the totals still are: an approval Relay can still draw on and
+        // tokens moved at once add up, and together may not pass the quote.
+        refuse(
+            &|q| {
+                q["steps"][1]["items"][0]["data"]["to"] = json!(USDC_ARB);
+                q["steps"][1]["items"][0]["data"]["data"] = json!(transfer(DEPOSITORY, 2_526_643));
+            },
             "take 5053286 from the wallet",
+        );
+        // Nothing may follow the funding transaction: the wallet owns the payment as soon as one
+        // transaction has gone out, so a later step — even a zero approval reset, or a second
+        // funding that still fits the quote — could leave a live deposit the page does not know
+        // it owns.
+        refuse(
+            &|q| {
+                let reset = q["steps"][1].clone();
+                q["steps"].as_array_mut().unwrap().push(reset);
+                q["steps"][2]["id"] = json!("reset");
+                q["steps"][2]["items"][0]["data"]["to"] = json!(USDC_ARB);
+                q["steps"][2]["items"][0]["data"]["data"] = json!(approve(DEPOSITORY, 0));
+            },
+            "comes after the payment is funded",
+        );
+        refuse(
+            &|q| {
+                q["steps"][0]["items"][0]["data"]["to"] = json!(USDC_ARB);
+                q["steps"][0]["items"][0]["data"]["data"] = json!(transfer(DEPOSITORY, 1_263_321));
+                q["steps"][1]["items"][0]["data"]["to"] = json!(USDC_ARB);
+                q["steps"][1]["items"][0]["data"]["data"] = json!(transfer(DEPOSITORY, 1_263_322));
+            },
+            "comes after the payment is funded",
         );
     }
 
@@ -1938,12 +2002,38 @@ mod tests {
             "fail without saying so",
         );
         // And the pulled tokens may not leave by a raw transfer: a token that returns false
-        // instead of reverting would strand them in the router, where anyone can sweep them.
+        // instead of reverting would strand them in the router, where anyone can sweep them —
+        // even when the transfer's destination is the depository itself.
+        refuse(
+            &[nested_call(USDC_ARB, false, 0, &transfer(DEPOSITORY, amount))],
+            Some((USDC_ARB, amount)),
+            "silently not make",
+        );
         refuse(
             &[nested_call(USDC_ARB, false, 0, &transfer(ROUTER, amount))],
             Some((USDC_ARB, amount)),
             "silently not make",
         );
+    }
+
+    #[test]
+    fn a_receiver_must_forward_bytes_that_decode() {
+        const RECEIVER: &str = "0x00000000000000000000000000000000000000d1";
+        let mut want = want();
+        want.relay_roles.receivers = vec![RECEIVER.parse().unwrap()];
+        let call = |data: &str| {
+            let calldata = hex::decode(data.trim_start_matches("0x")).unwrap();
+            let route = Route { id: "forward", want: &want, input_amount: U256::from(2_526_643u64), depth: 0 };
+            let wallet = WalletCall { to: RECEIVER.parse().unwrap(), calldata: &calldata, value: U256::ZERO };
+            check_relay_call(&wallet, &route, None)
+        };
+        // Empty bytes decode; the receiver only emits them.
+        let empty = format!("0xd948d468{:064x}{:064x}", 32, 0);
+        assert!(call(&empty).is_ok());
+        // A length that runs past the end does not decode, and neither does no argument at all.
+        let overlong = format!("0xd948d468{:064x}{:064x}", 32, 64);
+        assert!(call(&overlong).unwrap_err().contains("malformed forward"));
+        assert!(call("0xd948d468").unwrap_err().contains("malformed forward"));
     }
 
     #[test]
