@@ -147,24 +147,75 @@ pub struct RelayProtocolV2 {
     pub depository: Option<String>,
 }
 
+/// Relay's contracts on one chain, by role. The roles matter: a public router runs anyone's calls,
+/// so an allowance or a transfer of the payer's tokens that ends at one is there for anyone to
+/// sweep — only the depository may hold funds, and only the approval proxy may pull on an allowance.
+#[derive(Debug, Clone, Default)]
+pub struct RelayRoles {
+    /// Takes deposits (`depositErc20`/`depositNative`) and holds them for solver-signed orders.
+    pub depositories: Vec<Address>,
+    /// Pulls the payer's allowance (`transferAndMulticall`) and runs the route's calls.
+    pub approval_proxies: Vec<Address>,
+    /// Forwards the transaction's value to Relay's solver (`forward`).
+    pub receivers: Vec<Address>,
+    /// Runs a route's nested calls (`multicall`). Never a destination for an allowance or a
+    /// standalone transfer.
+    pub routers: Vec<Address>,
+}
+
+impl RelayRoles {
+    /// Is this one of Relay's contracts at all?
+    pub fn contains(&self, a: &Address) -> bool {
+        self.depositories.contains(a)
+            || self.approval_proxies.contains(a)
+            || self.receivers.contains(a)
+            || self.routers.contains(a)
+    }
+
+    /// A spender a wallet or router may approve: whoever is trusted to draw an allowance down only
+    /// as part of taking a deposit.
+    pub fn may_hold_allowance(&self, a: &Address) -> bool {
+        self.depositories.contains(a) || self.approval_proxies.contains(a)
+    }
+}
+
 impl RelayChain {
-    /// Relay's own contracts on this chain: where a route's origin transactions may send funds or
-    /// grant allowances (the depository, the approval proxy, the routers, the receiver).
-    pub fn relay_contracts(&self) -> Vec<Address> {
+    /// Relay's contracts on this chain, by role: where a route's origin transactions may send
+    /// funds or grant allowances, and for what.
+    pub fn relay_roles(&self) -> RelayRoles {
         let k = self.contracts.as_ref();
         let v3 = k.and_then(|k| k.v3.as_ref());
-        [
-            self.protocol.as_ref().and_then(|p| p.v2.as_ref()).and_then(|v2| v2.depository.as_deref()),
-            k.and_then(|k| k.relay_receiver.as_deref()),
-            k.and_then(|k| k.erc20_router.as_deref()),
-            k.and_then(|k| k.approval_proxy.as_deref()),
-            v3.and_then(|v| v.erc20_router.as_deref()),
-            v3.and_then(|v| v.approval_proxy.as_deref()),
-        ]
-        .into_iter()
-        .flatten()
-        .filter_map(|a| a.parse::<Address>().ok().filter(|a| !a.is_zero()))
-        .collect()
+        let parse = |raw: Option<&str>| -> Option<Address> {
+            raw.and_then(|a| a.parse::<Address>().ok().filter(|a| !a.is_zero()))
+        };
+        let mut roles = RelayRoles {
+            depositories: [parse(
+                self.protocol.as_ref().and_then(|p| p.v2.as_ref()).and_then(|v2| v2.depository.as_deref()),
+            )]
+            .into_iter()
+            .flatten()
+            .collect(),
+            approval_proxies: [
+                parse(k.and_then(|k| k.approval_proxy.as_deref())),
+                parse(v3.and_then(|v| v.approval_proxy.as_deref())),
+            ]
+            .into_iter()
+            .flatten()
+            .collect(),
+            receivers: [parse(k.and_then(|k| k.relay_receiver.as_deref()))].into_iter().flatten().collect(),
+            routers: [
+                parse(k.and_then(|k| k.erc20_router.as_deref())),
+                parse(v3.and_then(|v| v.erc20_router.as_deref())),
+            ]
+            .into_iter()
+            .flatten()
+            .collect(),
+        };
+        for list in [&mut roles.depositories, &mut roles.approval_proxies, &mut roles.receivers, &mut roles.routers] {
+            list.sort();
+            list.dedup();
+        }
+        roles
     }
 }
 

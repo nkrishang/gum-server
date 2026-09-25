@@ -40,7 +40,9 @@ use uuid::Uuid;
 
 use super::{Deposit, DepositStatus, store};
 use crate::clients::UpstreamError;
-use crate::clients::relay::{Quote, QuoteAmount, QuoteRequest, RelayChain, RelayChainCurrency, RelayMetadata};
+use crate::clients::relay::{
+    Quote, QuoteAmount, QuoteRequest, RelayChain, RelayChainCurrency, RelayMetadata, RelayRoles,
+};
 use crate::config::RelayConfig;
 use crate::error::ApiError;
 use crate::state::AppState;
@@ -442,9 +444,10 @@ pub struct Expected {
     pub token: Address,
     pub recipient: Address,
     pub amount: U256,
-    /// Relay's contracts on the origin chain (from `/chains`): the only addresses a route's
-    /// transactions may call, approve or transfer to, besides the origin token itself.
-    pub relay_contracts: Vec<Address>,
+    /// Relay's contracts on the origin chain (from `/chains`), by role: the only addresses a
+    /// route's transactions may call, approve or transfer to, besides the origin token itself —
+    /// and the roles decide which call may go where.
+    pub relay_roles: RelayRoles,
     /// The origin token's decimals, from Relay's own token lists — not from the quote, whose
     /// decimals decide what the route is worth on screen while the calldata spends base units.
     pub origin_decimals: u8,
@@ -489,7 +492,7 @@ pub async fn quote(
             "Relay does not route from this chain",
         ));
     };
-    expected.relay_contracts = origin.relay_contracts();
+    expected.relay_roles = origin.relay_roles();
     expected.origin_chain_names = chain_names(origin);
     expected.destination_chain_names =
         chains.iter().find(|c| c.id == expected.destination_chain_id).map(chain_names).unwrap_or_default();
@@ -503,7 +506,12 @@ pub async fn quote(
             let term = format!("{:#x}", expected.origin_currency);
             let found =
                 state.relay.search_currencies(&[expected.origin_chain_id], &term, 5).await.map_err(relay_error)?;
-            let decimals = found.iter().find(|t| t.address.eq_ignore_ascii_case(&term)).map(|t| t.decimals);
+            // The search is scoped to the origin chain, and so is this match: the same address on
+            // another chain is a different token, with different decimals.
+            let decimals = found
+                .iter()
+                .find(|t| t.chain_id == expected.origin_chain_id && t.address.eq_ignore_ascii_case(&term))
+                .map(|t| t.decimals);
             decimals.ok_or_else(|| {
                 ApiError::invalid("that token is not known to Relay on this chain; it can't be quoted safely")
             })?
@@ -582,7 +590,7 @@ fn expected(deposit: &Deposit, body: &QuoteBody) -> Result<Expected, ApiError> {
         token: deposit.token_address.parse().expect("stored addresses are valid"),
         recipient: deposit.payment_address(),
         amount,
-        relay_contracts: Vec::new(),
+        relay_roles: RelayRoles::default(),
         origin_decimals: 0,
         token_decimals: deposit.token_decimals as u8,
         origin_chain_names: Vec::new(),
@@ -602,10 +610,12 @@ fn chain_names(c: &RelayChain) -> Vec<String> {
 }
 
 /// The decimals of one of Relay's own tokens on a chain: the native currency for the zero address,
-/// otherwise its listing among the chain's tokens. `None` for a token Relay doesn't list there.
+/// otherwise its listing among the chain's tokens. `None` for a token Relay doesn't list there —
+/// including a chain whose own native currency Relay never named, whose decimals would otherwise
+/// be guessed.
 fn chain_token_decimals(c: &RelayChain, currency: Address) -> Option<u8> {
     if currency.is_zero() {
-        return Some(c.currency.as_ref().map(|n| n.decimals).unwrap_or(18));
+        return c.currency.as_ref().map(|n| n.decimals);
     }
     let raw = format!("{currency:#x}");
     c.featured_tokens
@@ -702,7 +712,7 @@ pub fn check_quote(quote: &Quote, want: &Expected) -> Result<RouteQuote, String>
         .and_then(|p| p.pointer("/v2/orderData"))
         .filter(|o| o.is_object())
         .ok_or("no signed order (protocol.v2.orderData) to check")?;
-    check_order(order, want)?;
+    check_order(order, want, input_amount)?;
 
     let mut spend = Spend::default();
     let mut steps = Vec::new();
@@ -722,7 +732,7 @@ pub fn check_quote(quote: &Quote, want: &Expected) -> Result<RouteQuote, String>
     let mut value = U256::ZERO;
     for step in &steps {
         let step_value = base_units(Some(&step.value)).unwrap_or(U256::MAX);
-        value = value.checked_add(step_value).unwrap_or(U256::MAX);
+        value = value.checked_add(step_value).ok_or("the route's native value overflows")?;
     }
     let limit = if want.origin_currency.is_zero() { input_amount } else { U256::ZERO };
     if value > limit {
@@ -730,7 +740,7 @@ pub fn check_quote(quote: &Quote, want: &Expected) -> Result<RouteQuote, String>
     }
     // And the token it may take — transfers now, plus what approvals let Relay draw down — is the
     // quoted input, across the whole route, not just each step on its own.
-    let taken = spend.exposure();
+    let taken = spend.exposure()?;
     if taken > input_amount {
         return Err(format!("the steps take {taken} from the wallet; the quote is for {input_amount}"));
     }
@@ -772,10 +782,10 @@ fn is_chain(field: Option<&Value>, id: u64, names: &[String]) -> bool {
 
 /// The signed order behind the route (`protocol.v2.orderData`). Its terms are the route's: it pays
 /// the payment address the deposit's token on the deposit's chain, at least `amount` guaranteed;
-/// it takes the quoted input on the origin chain; and refunds go to the payer, or (Relay's
-/// fallback) to the payment address in the deposit's own token. A missing or malformed term is a
-/// refusal — never taken on faith.
-fn check_order(order: &Value, want: &Expected) -> Result<(), String> {
+/// it takes the quoted input on the origin chain, and no more than that; and refunds go to the
+/// payer, or (Relay's fallback) to the payment address in the deposit's own token. A missing or
+/// malformed term is a refusal — never taken on faith.
+fn check_order(order: &Value, want: &Expected, input_amount: U256) -> Result<(), String> {
     let output = order.get("output").ok_or("the signed order has no output")?;
     let payments =
         output.get("payments").and_then(Value::as_array).ok_or("the signed order has no payments to check")?;
@@ -804,6 +814,10 @@ fn check_order(order: &Value, want: &Expected) -> Result<(), String> {
     }
 
     let inputs = order.get("inputs").and_then(Value::as_array).ok_or("the signed order has no inputs")?;
+    if inputs.is_empty() {
+        return Err("the signed order takes nothing".into());
+    }
+    let mut taken = U256::ZERO;
     for input in inputs {
         let payment =
             input.get("payment").filter(|p| p.is_object()).ok_or("an input of the signed order has no payment")?;
@@ -814,18 +828,21 @@ fn check_order(order: &Value, want: &Expected) -> Result<(), String> {
         if !is_chain(payment.get("chainId"), want.origin_chain_id, &want.origin_chain_names) {
             return Err(format!("the order takes {currency} on {:?}", payment.get("chainId")));
         }
-        if base_units(payment.get("amount").and_then(Value::as_str)).is_none() {
-            return Err("an input of the signed order has no amount".into());
-        }
+        let amount = base_units(payment.get("amount").and_then(Value::as_str))
+            .ok_or("an input of the signed order has no amount")?;
+        taken = taken.checked_add(amount).ok_or("the signed order's inputs overflow")?;
         // Refunds go to the payer, or (Relay's fallback) to the payment address in the deposit's
         // own token, which is where it counts; never anywhere else, and never on a chain that is
         // neither the origin nor the destination.
         let refunds =
             input.get("refunds").and_then(Value::as_array).ok_or("an input of the signed order has no refunds")?;
+        if refunds.is_empty() {
+            return Err("an input of the signed order has nowhere its refunds go".into());
+        }
         for refund in refunds {
             let to = refund.get("recipient").and_then(Value::as_str).unwrap_or_default();
             let currency = refund.get("currency").and_then(Value::as_str).unwrap_or_default();
-            let to_payer = same_address(to, want.user);
+            let to_payer = same_address(to, want.user) && same_address(currency, want.origin_currency);
             let to_deposit = same_address(to, want.recipient) && same_address(currency, want.token);
             let on_origin = is_chain(refund.get("chainId"), want.origin_chain_id, &want.origin_chain_names);
             let on_destination =
@@ -837,6 +854,11 @@ fn check_order(order: &Value, want: &Expected) -> Result<(), String> {
                 ));
             }
         }
+    }
+    // What the order says it takes is what the quote asks the wallet for: an order that takes more
+    // would spend past the quote, and one that takes less does not match it.
+    if taken != input_amount {
+        return Err(format!("the order takes {taken}, not the quoted {input_amount}"));
     }
     Ok(())
 }
@@ -906,8 +928,10 @@ impl Spend {
     }
 
     /// Everything the route could still take: what moved, plus every allowance it granted.
-    fn exposure(&self) -> U256 {
-        self.allowances.values().fold(self.pulled, |sum, a| sum.saturating_add(*a))
+    fn exposure(&self) -> Result<U256, String> {
+        self.allowances.values().try_fold(self.pulled, |sum, a| {
+            sum.checked_add(*a).ok_or_else(|| "the route's token spending overflows".to_owned())
+        })
     }
 }
 
@@ -984,15 +1008,20 @@ impl<'a> Abi<'a> {
     }
 
     /// Relay's nested calls, `(address target, bool allowFailure, uint256 value, bytes callData)[]`.
-    fn nested_calls(&mut self) -> Option<Vec<(Address, U256, &'a [u8])>> {
+    fn nested_calls(&mut self) -> Option<Vec<NestedCall<'a>>> {
         self.static_items(|r| {
             let at = r.base.checked_add(r.offset()?)?;
             let mut el = Abi::at(r.bytes, at, at);
             let target = el.address()?;
-            let _allow_failure = el.uint()?;
+            // `bool` is a byte in a word; anything else is not a bool.
+            let allow_failure = match el.uint()? {
+                raw if raw.is_zero() => false,
+                raw if raw == U256::ONE => true,
+                _ => return None,
+            };
             let value = el.uint()?;
             let data = el.bytes()?;
-            Some((target, value, data))
+            Some(NestedCall { target, allow_failure, value, data })
         })
     }
 }
@@ -1005,19 +1034,42 @@ struct WalletCall<'a> {
     value: U256,
 }
 
+/// What one `transferAndMulticall` pull must account for. The proxy moves the pulled tokens to the
+/// router, whose nested calls must then get them out of it — into the depository, as the deposit —
+/// because ERC-20s left in the router are there for anyone to sweep (the router's cleanup is
+/// permissionless, and only native is refunded on its own).
+#[derive(Default)]
+struct Flow {
+    /// Allowances the nested calls granted the depository, still undrawn.
+    granted: BTreeMap<Address, U256>,
+    /// Tokens the nested calls moved into the depository.
+    consumed: U256,
+}
+
+/// One of Relay's nested calls, `(address target, bool allowFailure, uint256 value, bytes callData)`.
+struct NestedCall<'a> {
+    target: Address,
+    allow_failure: bool,
+    value: U256,
+    data: &'a [u8],
+}
+
+/// What every call of a route is held against: the step it belongs to, the route's terms, how much
+/// the quote takes, and how deep the nesting has gone.
+struct Route<'a> {
+    id: &'a str,
+    want: &'a Expected,
+    input_amount: U256,
+    depth: u8,
+}
+
 /// A call to one of Relay's contracts. The payer-facing entrypoints are known and decoded; each is
 /// checked for what it debits from the wallet, who it can pay back, and what it nests. `spend` is
 /// the wallet's tab, kept only for calls the wallet itself makes (`Some`); a Relay contract's own
 /// nested calls spend what the transaction brought it — already on the tab at the pull — so they
 /// are bounded per call but debited nowhere.
-fn check_relay_call(
-    id: &str,
-    call: &WalletCall,
-    want: &Expected,
-    input_amount: U256,
-    mut spend: Option<&mut Spend>,
-    depth: u8,
-) -> Result<(), String> {
+fn check_relay_call(call: &WalletCall, route: &Route, mut spend: Option<&mut Spend>) -> Result<(), String> {
+    let Route { id, want, input_amount, depth } = *route;
     let to = call.to;
     let tx_value = call.value;
     let calldata = call.calldata;
@@ -1027,15 +1079,35 @@ fn check_relay_call(
         calldata.split_at_checked(4).ok_or_else(|| format!("step {id} calls {to:#x} with no selector"))?;
     let selector: &[u8; 4] = head.try_into().map_err(|_| format!("step {id} has malformed calldata"))?;
     let refuse = |what: String| format!("step {id} {what}");
+    let roles = &want.relay_roles;
+
+    // Each entrypoint belongs to one role, and a role is only trusted at its own address: the
+    // depository takes deposits, the approval proxy pulls on an allowance, the receiver forwards
+    // value, the router runs nested calls. A known selector sent to a contract that plays no such
+    // part is a refusal, not a decode.
+    if matches!(*selector, DEPOSIT_ERC20 | DEPOSIT_ERC20_ALL | DEPOSIT_NATIVE) && !roles.depositories.contains(&to) {
+        return Err(refuse(format!("deposits through {to:#x}, which is not Relay's depository")));
+    }
+    if matches!(*selector, MULTICALL | MULTICALL_V2) && !roles.routers.contains(&to) {
+        return Err(refuse(format!("runs nested calls through {to:#x}, which is not Relay's router")));
+    }
+    if matches!(*selector, TRANSFER_AND_MULTICALL | TRANSFER_AND_MULTICALL_V2) && !roles.approval_proxies.contains(&to)
+    {
+        return Err(refuse(format!("pulls on an allowance through {to:#x}, which is not Relay's approval proxy")));
+    }
+    if *selector == FORWARD && !roles.receivers.contains(&to) {
+        return Err(refuse(format!("forwards value through {to:#x}, which is not Relay's receiver")));
+    }
 
     match *selector {
-        // A deposit: Relay's depository draws the quoted input down from the payer's allowance to
-        // it, for the order the route was quoted for.
+        // A deposit: Relay's depository draws the amount down from the caller's allowance to it
+        // (the payer's, at the top level), for the order the route was quoted for.
         DEPOSIT_ERC20 => {
             let mut r = Abi::new(args);
             let depositor = r.address().ok_or_else(|| refuse("has malformed depositErc20 arguments".into()))?;
             let token = r.address().ok_or_else(|| refuse("has malformed depositErc20 arguments".into()))?;
             let amount = r.uint().ok_or_else(|| refuse("has malformed depositErc20 arguments".into()))?;
+            r.word().ok_or_else(|| refuse("has malformed depositErc20 arguments".into()))?; // the order id
             if !depositor.is_zero() && depositor != want.user {
                 return Err(refuse(format!("deposits as {depositor:#x}, not the payer")));
             }
@@ -1057,14 +1129,16 @@ fn check_relay_call(
         DEPOSIT_NATIVE => {
             let mut r = Abi::new(args);
             let depositor = r.address().ok_or_else(|| refuse("has malformed depositNative arguments".into()))?;
+            r.word().ok_or_else(|| refuse("has malformed depositNative arguments".into()))?; // the order id
             if !depositor.is_zero() && depositor != want.user {
                 return Err(refuse(format!("deposits as {depositor:#x}, not the payer")));
             }
         }
         // The router and the approval proxy run the route's swap as nested calls; the proxy first
-        // pulls the quoted input from the wallet, through the allowance to it.
+        // moves the quoted input from the wallet to the router, through the allowance to it.
         MULTICALL | MULTICALL_V2 | TRANSFER_AND_MULTICALL | TRANSFER_AND_MULTICALL_V2 => {
             let pulls = matches!(*selector, TRANSFER_AND_MULTICALL | TRANSFER_AND_MULTICALL_V2);
+            let with_metadata = matches!(*selector, MULTICALL | TRANSFER_AND_MULTICALL);
             let mut r = Abi::new(args);
             let (tokens, amounts) = if pulls {
                 let tokens = r
@@ -1080,12 +1154,21 @@ fn check_relay_call(
             let calls = r.nested_calls().ok_or_else(|| refuse("has malformed multicall arguments".into()))?;
             let refund_to = r.address().ok_or_else(|| refuse("has malformed multicall arguments".into()))?;
             let nft_recipient = r.address().ok_or_else(|| refuse("has malformed multicall arguments".into()))?;
+            if with_metadata {
+                r.bytes().ok_or_else(|| refuse("has malformed multicall arguments".into()))?;
+            }
             if !refund_to.is_zero() && refund_to != want.user {
                 return Err(refuse(format!("sends its surplus to {refund_to:#x}, not the payer")));
             }
             if !nft_recipient.is_zero() && nft_recipient != want.user {
                 return Err(refuse(format!("sends its claims to {nft_recipient:#x}, not the payer")));
             }
+            // Whatever native is left over, the router refunds to `refundTo` — the payer, above.
+            if pulls && calls.is_empty() {
+                return Err(refuse("pulls the quoted input but runs no calls to deposit it".into()));
+            }
+            let mut nested_value = U256::ZERO;
+            let mut pulled_total = U256::ZERO;
             if let (Some(tokens), Some(amounts)) = (tokens, amounts) {
                 if tokens.len() != amounts.len() {
                     return Err(refuse("pulls tokens and amounts of different lengths".into()));
@@ -1094,23 +1177,40 @@ fn check_relay_call(
                     if token != want.origin_currency {
                         return Err(refuse(format!("pulls {token:#x}, not the token being paid with")));
                     }
+                    if want.origin_currency.is_zero() {
+                        return Err(refuse("pulls the chain's native currency, which no allowance can".into()));
+                    }
                     if amount > input_amount {
                         return Err(refuse(format!("pulls {amount}, more than the quoted {input_amount}")));
                     }
                     if let Some(spend) = spend.as_deref_mut() {
                         spend.pull(to, amount).map_err(refuse)?;
                     }
+                    pulled_total = pulled_total
+                        .checked_add(amount)
+                        .ok_or_else(|| refuse("pulls more than a quote can bound".into()))?;
                 }
             }
-            // The nested calls move what this transaction brought: at most the wallet's value, to
-            // Relay's contracts or through the quoted token, never anywhere else.
-            let mut nested_value = U256::ZERO;
-            for (target, value, data) in calls {
+            // A pull with nowhere to go strands the tokens in the router, where anyone can sweep
+            // them: every pulled token must come out the far side, into the depository.
+            let mut flow = if pulls { Some(Flow::default()) } else { None };
+            for NestedCall { target, allow_failure, value, data } in calls {
+                if allow_failure {
+                    return Err(refuse("nests a call that may fail without saying so".into()));
+                }
                 nested_value = nested_value.checked_add(value).ok_or_else(|| refuse("nested calls overflow".into()))?;
                 if nested_value > tx_value {
                     return Err(refuse("nests calls worth more than the transaction's value".into()));
                 }
-                check_nested_call(id, target, data, want, input_amount, depth).map_err(refuse)?;
+                let nested = Route { id, want, input_amount, depth: depth + 1 };
+                check_nested_call(target, value, data, &nested, flow.as_mut()).map_err(refuse)?;
+            }
+            if let Some(flow) = flow.filter(|f| f.consumed != pulled_total) {
+                return Err(refuse(format!(
+                    "leaves {} of the pulled {} in Relay's router, where anyone could sweep it",
+                    pulled_total - flow.consumed,
+                    pulled_total
+                )));
             }
         }
         // The receiver only forwards the transaction's value to Relay's solver; the value is
@@ -1123,20 +1223,24 @@ fn check_relay_call(
 
 /// A call nested in a Relay router's multicall, run by the router. It can only move what the
 /// transaction brought the router — counted on the wallet's tab at the pull — so each call is
-/// bounded by the quoted input, and nothing here debits the wallet twice.
+/// bounded by the quoted input, and nothing here debits the wallet twice. `flow`, for a proxy's
+/// pull, tracks the pulled tokens out towards the depository.
 fn check_nested_call(
-    id: &str,
     target: Address,
+    value: U256,
     data: &[u8],
-    want: &Expected,
-    input_amount: U256,
-    depth: u8,
+    route: &Route,
+    mut flow: Option<&mut Flow>,
 ) -> Result<(), String> {
+    let Route { id, want, input_amount, depth } = *route;
     let refuse = |what: String| format!("step {id} {what}");
     if depth > 1 {
         return Err(refuse("nests calls within nested calls".into()));
     }
     if !want.origin_currency.is_zero() && target == want.origin_currency {
+        if !value.is_zero() {
+            return Err(refuse("sends value with a call on the token, which takes none".into()));
+        }
         let (selector, args) =
             data.split_at_checked(4).ok_or_else(|| refuse("nests a call on the token with no selector".into()))?;
         if *selector != APPROVE && *selector != TRANSFER {
@@ -1146,19 +1250,55 @@ fn check_nested_call(
             return Err(refuse("nests a call on the token with truncated arguments".into()));
         }
         let spender = Address::from_slice(&args[12..32]);
-        if !want.relay_contracts.contains(&spender) {
-            return Err(refuse(format!("nests a call towards {spender:#x}, which is not Relay's")));
-        }
-        // The router's own allowance and transfers, bounded by the quote.
         let amount = U256::from_be_slice(&args[32..64]);
         if amount > input_amount {
             return Err(refuse(format!("nests a call for {amount}, more than the quoted {input_amount}")));
         }
+        if *selector == APPROVE {
+            // The router's allowance may only go to whoever turns an allowance into a deposit.
+            if !want.relay_roles.may_hold_allowance(&spender) {
+                return Err(refuse(format!("nests an allowance to {spender:#x}, which may not hold one")));
+            }
+            if let Some(flow) = flow.as_deref_mut() {
+                let slot = flow.granted.entry(spender).or_default();
+                *slot = slot.checked_add(amount).ok_or_else(|| refuse("nested allowances overflow".into()))?;
+            }
+        } else {
+            // And the router's tokens may only go where deposits are held.
+            if !want.relay_roles.depositories.contains(&spender) {
+                return Err(refuse(format!("nests a transfer to {spender:#x}, which is not Relay's depository")));
+            }
+            if let Some(flow) = flow {
+                flow.consumed =
+                    flow.consumed.checked_add(amount).ok_or_else(|| refuse("nested transfers overflow".into()))?;
+            }
+        }
         return Ok(());
     }
-    if want.relay_contracts.contains(&target) {
-        let nested = WalletCall { to: target, calldata: data, value: U256::ZERO };
-        return check_relay_call(id, &nested, want, input_amount, None, depth + 1);
+    if want.relay_roles.contains(&target) {
+        let nested = WalletCall { to: target, calldata: data, value };
+        // A nested deposit draws the router's fresh allowance down; charge it to the flow.
+        let pulls_deposit =
+            flow.is_some() && want.relay_roles.depositories.contains(&target) && data.starts_with(&DEPOSIT_ERC20);
+        let deeper = Route { id, want, input_amount, depth: depth + 1 };
+        check_relay_call(&nested, &deeper, None)?;
+        if pulls_deposit {
+            // depositErc20(depositor, token, amount, id): the amount is the third word of the
+            // arguments, and the recursion above has already checked the calldata's shape.
+            let amount = U256::from_be_slice(data.get(68..100).unwrap_or(&[]));
+            let flow = flow.expect("pulls_deposit means flow is some");
+            let slot = flow
+                .granted
+                .get_mut(&target)
+                .ok_or_else(|| refuse(format!("draws down {amount} no nested call approved")))?;
+            if *slot < amount {
+                return Err(refuse(format!("draws down {amount}, more than the nested calls approved")));
+            }
+            *slot -= amount;
+            flow.consumed =
+                flow.consumed.checked_add(amount).ok_or_else(|| refuse("nested deposits overflow".into()))?;
+        }
+        return Ok(());
     }
     Err(refuse(format!("nests a call to {target:#x}, which is neither Relay's nor the payer's token")))
 }
@@ -1194,7 +1334,8 @@ fn check_step(
     let value_wei = base_units(Some(&value)).unwrap_or(U256::MAX);
     if !want.origin_currency.is_zero() && to == want.origin_currency {
         // A call on the payer's token: an allowance or a transfer to Relay, for no more than the
-        // quoted input. (A deposit by transfer appends Relay's order id after the arguments.)
+        // quoted input. A public router may be neither's destination — its calls are anyone's, so
+        // an allowance or tokens left with it are there for anyone to sweep.
         let (selector, args) =
             bytes.split_at_checked(4).ok_or_else(|| format!("step {id} calls the token with no selector"))?;
         if (selector != APPROVE && selector != TRANSFER) || args.len() < 64 {
@@ -1202,21 +1343,25 @@ fn check_step(
         }
         let target = Address::from_slice(&args[12..32]);
         let amount = U256::from_be_slice(&args[32..64]);
-        if !want.relay_contracts.contains(&target) {
-            return Err(format!("step {id} approves or transfers to {target:#x}, which is not Relay's"));
-        }
         if amount > input_amount {
             return Err(format!("step {id} approves or transfers {amount}, more than the quoted {input_amount}"));
         }
         if selector == APPROVE {
+            if !want.relay_roles.may_hold_allowance(&target) {
+                return Err(format!("step {id} approves {target:#x}, which may not hold an allowance"));
+            }
             spend.grant(target, amount);
         } else {
+            if !want.relay_roles.depositories.contains(&target) {
+                return Err(format!("step {id} transfers to {target:#x}, which is not Relay's depository"));
+            }
             spend.transfer(amount).map_err(|e| format!("step {id} {e}"))?;
         }
-    } else if want.relay_contracts.contains(&to) {
+    } else if want.relay_roles.contains(&to) {
         // A call on one of Relay's contracts: decoded and held against the route's terms.
         let call = WalletCall { to, calldata: &bytes, value: value_wei };
-        check_relay_call(id, &call, want, input_amount, Some(spend), 0)?;
+        let route = Route { id, want, input_amount, depth: 0 };
+        check_relay_call(&call, &route, Some(spend))?;
     } else {
         return Err(format!("step {id} calls {to:#x}, which is not one of Relay's contracts on the origin chain"));
     }
@@ -1356,6 +1501,7 @@ mod tests {
     const DEPOSITORY: &str = "0x4cd00e387622c35bddb9b4c962c136462338bc31";
     const REQUEST: &str = "0x1790248938255ff5c9db51e367a55380edb458572f010bc52415d45da935ffd5";
     const APPROVAL_PROXY: &str = "0xccc88a9d1b4ed6b0eaba998850414b24f1c315be";
+    const ROUTER: &str = "0xb92fe925dc43a0ecde6c8b1a2709c170ec4fff4f";
     /// `approve(depository, 2526643)`, as Relay sends it.
     const APPROVE_DEPOSITORY: &str = "0x095ea7b30000000000000000000000004cd00e387622c35bddb9b4c962c136462338bc310000000000000000000000000000000000000000000000000000000000268db3";
 
@@ -1391,7 +1537,12 @@ mod tests {
             token: USDC_BASE.parse().unwrap(),
             recipient: PAYMENT.parse().unwrap(),
             amount: U256::from(2_500_000u64),
-            relay_contracts: vec![DEPOSITORY.parse().unwrap(), APPROVAL_PROXY.parse().unwrap()],
+            relay_roles: RelayRoles {
+                depositories: vec![DEPOSITORY.parse().unwrap()],
+                approval_proxies: vec![APPROVAL_PROXY.parse().unwrap()],
+                receivers: vec![],
+                routers: vec![ROUTER.parse().unwrap()],
+            },
             origin_decimals: 6,
             token_decimals: 6,
             origin_chain_names: vec!["arbitrum".into()],
@@ -1495,6 +1646,16 @@ mod tests {
         refuse(&|q| q["protocol"]["v2"]["orderData"]["inputs"][0]["payment"] = Value::Null, "has no payment");
         refuse(&|q| q["protocol"]["v2"]["orderData"]["inputs"][0]["refunds"] = Value::Null, "has no refunds");
         refuse(
+            &|q| q["protocol"]["v2"]["orderData"]["inputs"][0]["payment"]["amount"] = json!("1"),
+            "the order takes 1",
+        );
+        refuse(&|q| q["protocol"]["v2"]["orderData"]["inputs"] = json!([]), "takes nothing");
+        refuse(&|q| q["protocol"]["v2"]["orderData"]["inputs"][0]["refunds"] = json!([]), "nowhere its refunds go");
+        refuse(
+            &|q| q["protocol"]["v2"]["orderData"]["inputs"][0]["refunds"][0]["currency"] = json!(other),
+            "neither the payer's nor this payment's",
+        );
+        refuse(
             &|q| q["protocol"]["v2"]["orderData"]["inputs"][0]["refunds"][0]["recipient"] = json!(other),
             "the order refunds",
         );
@@ -1513,7 +1674,20 @@ mod tests {
         refuse(&|q| q["steps"][1]["items"][0]["data"]["to"] = json!(other), "not one of Relay's contracts");
         refuse(
             &|q| q["steps"][0]["items"][0]["data"]["data"] = json!(approve(other, 2_526_643)),
-            "which is not Relay's",
+            "which may not hold an allowance",
+        );
+        // A public router runs anyone's calls: an allowance or a transfer that ends at one is
+        // there for anyone to sweep.
+        refuse(
+            &|q| q["steps"][0]["items"][0]["data"]["data"] = json!(approve(ROUTER, 2_526_643)),
+            "may not hold an allowance",
+        );
+        refuse(
+            &|q| {
+                q["steps"][0]["items"][0]["data"]["data"] = json!(transfer(ROUTER, 2_526_643));
+                q["steps"][1]["items"][0]["data"]["data"] = json!(deposit_erc20(PAYER, USDC_ARB, 0, REQUEST));
+            },
+            "not Relay's depository",
         );
         refuse(
             &|q| q["steps"][0]["items"][0]["data"]["data"] = json!(approve(DEPOSITORY, 2_526_644)),
@@ -1530,6 +1704,13 @@ mod tests {
         // an unbounded whole-allowance deposit, an entrypoint the checks don't decode, and a route
         // that pulls twice.
         refuse(&|q| q["steps"][1]["items"][0]["data"]["data"] = json!("0xe8017952aa"), "malformed depositErc20");
+        refuse(
+            &|q| {
+                q["steps"][1]["items"][0]["data"]["data"] =
+                    json!(format!("0xe8017952{:0>192}", PAYER.trim_start_matches("0x")))
+            },
+            "malformed depositErc20",
+        );
         refuse(
             &|q| q["steps"][1]["items"][0]["data"]["data"] = json!(deposit_erc20(other, USDC_ARB, 2_526_643, REQUEST)),
             "deposits as",
@@ -1568,6 +1749,7 @@ mod tests {
         q["details"]["currencyIn"]["currency"]["address"] = json!(NATIVE);
         q["details"]["currencyIn"]["amount"] = json!("955024944952040");
         q["protocol"]["v2"]["orderData"]["inputs"][0]["payment"]["currency"] = json!(NATIVE);
+        q["protocol"]["v2"]["orderData"]["inputs"][0]["payment"]["amount"] = json!("955024944952040");
         q["protocol"]["v2"]["orderData"]["inputs"][0]["refunds"][0]["currency"] = json!(NATIVE);
         q["steps"] = json!([q["steps"][1].clone()]);
         q["steps"][0]["items"][0]["data"]["data"] = json!(deposit_native(PAYER, REQUEST));
@@ -1595,27 +1777,169 @@ mod tests {
 
     #[test]
     fn a_router_multicall_route_is_decoded_and_held_to_the_terms() {
-        // The happy route: the wallet calls Relay's depository with a nested depositErc20.
-        let route = check(router_quote(MULTICALL_ROUTE, DEPOSITORY)).unwrap();
+        // The happy route: the wallet calls Relay's router, which nests the depository's deposit.
+        let route = check(router_quote(MULTICALL_ROUTE, ROUTER)).unwrap();
         assert_eq!(route.steps.len(), 1);
-        assert_eq!(route.steps[0].to, DEPOSITORY.to_ascii_lowercase());
+        assert_eq!(route.steps[0].to, ROUTER.to_ascii_lowercase());
 
         let refuse = |data: &str, to: &str, why: &str| {
             let err = check(router_quote(data, to)).unwrap_err();
             assert!(err.contains(why), "{err} (expected {why})");
         };
+        // An entrypoint only works at a contract of its own role: the router's multicall sent to
+        // the depository, and a deposit sent to the router, are both refused.
+        refuse(MULTICALL_ROUTE, DEPOSITORY, "not Relay's router");
+        refuse(&deposit_erc20(PAYER, USDC_ARB, 2_526_643, REQUEST), ROUTER, "not Relay's depository");
         // Canonical encoding, but the surplus and the claims go to someone else.
         const BAD_REFUND: &str = "0xcd6e13f700000000000000000000000000000000000000000000000000000000000000800000000000000000000000000000000000000000000000000000000000000bad000000000000000000000000d8da6bf26964af9d7eed9e03e53415d37aa960450000000000000000000000000000000000000000000000000000000000000200000000000000000000000000000000000000000000000000000000000000000100000000000000000000000000000000000000000000000000000000000000200000000000000000000000004cd00e387622c35bddb9b4c962c136462338bc310000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000800000000000000000000000000000000000000000000000000000000000000084e8017952000000000000000000000000d8da6bf26964af9d7eed9e03e53415d37aa96045000000000000000000000000af88d065e77c8cc2239327c5edb3a432268e58310000000000000000000000000000000000000000000000000000000000268db31790248938255ff5c9db51e367a55380edb458572f010bc52415d45da935ffd5000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000";
-        refuse(BAD_REFUND, DEPOSITORY, "not the payer");
-        // A nested transfer of the router's tokens to an address that is not Relay's.
+        refuse(BAD_REFUND, ROUTER, "not the payer");
+        // A nested transfer of the router's tokens to an address that is not the depository's.
         const BAD_NESTED: &str = "0xcd6e13f70000000000000000000000000000000000000000000000000000000000000080000000000000000000000000d8da6bf26964af9d7eed9e03e53415d37aa96045000000000000000000000000d8da6bf26964af9d7eed9e03e53415d37aa9604500000000000000000000000000000000000000000000000000000000000001c000000000000000000000000000000000000000000000000000000000000000010000000000000000000000000000000000000000000000000000000000000020000000000000000000000000af88d065e77c8cc2239327c5edb3a432268e58310000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000800000000000000000000000000000000000000000000000000000000000000044a9059cbb0000000000000000000000000000000000000000000000000000000000000bad0000000000000000000000000000000000000000000000000000000000268db3000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000";
-        refuse(BAD_NESTED, DEPOSITORY, "which is not Relay's");
+        refuse(BAD_NESTED, ROUTER, "not Relay's depository");
         // An entrypoint the checks don't decode.
-        refuse("0x2d9fb478", DEPOSITORY, "the checks don't decode");
+        refuse("0x2d9fb478", ROUTER, "the checks don't decode");
+    }
+
+    /// One nested call as its ABI tuple, `(address, bool, uint256, bytes)` — `data` is the calldata
+    /// hex, padded right to whole words.
+    fn nested_call(target: &str, allow_failure: bool, value: u64, data: &str) -> String {
+        let data = data.trim_start_matches("0x");
+        let words = data.len().div_ceil(64);
+        format!(
+            "{:0>64}{:064x}{value:064x}{:064x}{:064x}{:0<width$}",
+            target.trim_start_matches("0x"),
+            u8::from(allow_failure),
+            4 * 32,         // the bytes argument's offset, from the tuple's start
+            data.len() / 2, // its byte length
+            data,
+            width = words * 64
+        )
+    }
+
+    /// `transferAndMulticall(address[],uint256[],(address,bool,uint256,bytes)[],address,address,bytes)`
+    /// as Relay's approval proxy takes it: one pull (`None` for none), the nested calls, and where
+    /// the surplus goes.
+    fn transfer_and_multicall(
+        pull: Option<(&str, u64)>,
+        calls: &[String],
+        refund_to: &str,
+        nft_recipient: &str,
+    ) -> String {
+        let pulled = usize::from(pull.is_some());
+        // Head offsets, relative to the arguments: the two static arrays, then the calls array,
+        // then the (empty) metadata bytes.
+        let tokens_at = 6 * 32;
+        let amounts_at = tokens_at + 32 + pulled * 32;
+        let calls_at = amounts_at + 32 + pulled * 32;
+        let tuples: String = calls.concat();
+        let metadata_at = calls_at + 32 + calls.len() * 32 + tuples.len() / 2;
+        let mut out = String::from("0xf9e4bab4");
+        for at in [tokens_at, amounts_at, calls_at] {
+            out += &format!("{at:064x}");
+        }
+        out += &format!("{:0>64}", refund_to.trim_start_matches("0x"));
+        out += &format!("{:0>64}", nft_recipient.trim_start_matches("0x"));
+        out += &format!("{metadata_at:064x}");
+        out += &format!("{:064x}", pulled);
+        if let Some((token, _)) = pull {
+            out += &format!("{:0>64}", token.trim_start_matches("0x"));
+        }
+        out += &format!("{:064x}", pulled);
+        if let Some((_, amount)) = pull {
+            out += &format!("{amount:064x}");
+        }
+        out += &format!("{:064x}", calls.len());
+        // The calls' element offsets are relative to after the length word.
+        let mut at = 32 * calls.len();
+        for call in calls {
+            out += &format!("{at:064x}");
+            at += call.len() / 2;
+        }
+        out += &tuples;
+        out += &"0".repeat(64); // metadata: zero length, no data
+        out
+    }
+
+    /// The proxy route: approve the proxy, then one pull of the quoted input whose nested calls
+    /// take it on to the depository.
+    fn proxy_quote(approve_amount: u64, pull: Option<(&str, u64)>, calls: &[String]) -> Value {
+        let mut q = relay_quote();
+        q["steps"] = json!([
+            { "id": "approve", "kind": "transaction", "description": "Sign an approval",
+              "items": [{ "status": "incomplete", "data": { "from": "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045",
+                                                            "to": USDC_ARB, "data": approve(APPROVAL_PROXY, approve_amount),
+                                                            "value": "0", "chainId": 42161 } }] },
+            { "id": "proxy", "kind": "transaction", "description": "Sign to route",
+              "items": [{ "status": "incomplete", "data": { "from": "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045",
+                                                            "to": APPROVAL_PROXY,
+                                                            "data": transfer_and_multicall(pull, calls, PAYER, PAYER),
+                                                            "value": "0", "chainId": 42161 } }] }
+        ]);
+        q
     }
 
     #[test]
-    fn relay_contracts_come_from_the_chain() {
+    fn a_proxy_pull_must_end_in_the_depository() {
+        let amount = 2_526_643u64;
+        // The honest shape: pull the quoted input, approve the depository for it, deposit it —
+        // counted once, despite passing through two contracts.
+        let honest = vec![
+            nested_call(USDC_ARB, false, 0, &approve(DEPOSITORY, amount)),
+            nested_call(DEPOSITORY, false, 0, &deposit_erc20(PAYER, USDC_ARB, amount, REQUEST)),
+        ];
+        let route = check(proxy_quote(amount, Some((USDC_ARB, amount)), &honest)).unwrap();
+        assert_eq!(route.steps.len(), 2);
+        assert_eq!(route.steps[1].to, APPROVAL_PROXY.to_ascii_lowercase());
+
+        let refuse = |calls: &[String], pull: Option<(&str, u64)>, why: &str| {
+            let err = check(proxy_quote(amount, pull, calls)).unwrap_err();
+            assert!(err.contains(why), "{err} (expected {why})");
+        };
+        // A pull that runs no calls strands the tokens in the router, where anyone can sweep them.
+        refuse(&[], Some((USDC_ARB, amount)), "runs no calls");
+        // So does one that approves without depositing, or deposits less than it pulled.
+        refuse(&[nested_call(USDC_ARB, false, 0, &approve(DEPOSITORY, amount))], Some((USDC_ARB, amount)), "leaves");
+        refuse(
+            &[
+                nested_call(USDC_ARB, false, 0, &approve(DEPOSITORY, amount)),
+                nested_call(DEPOSITORY, false, 0, &deposit_erc20(PAYER, USDC_ARB, amount - 1, REQUEST)),
+            ],
+            Some((USDC_ARB, amount)),
+            "leaves",
+        );
+        // A deposit that draws more than the nested calls approved, and one with no approval at all.
+        refuse(
+            &[
+                nested_call(USDC_ARB, false, 0, &approve(DEPOSITORY, amount - 1)),
+                nested_call(DEPOSITORY, false, 0, &deposit_erc20(PAYER, USDC_ARB, amount, REQUEST)),
+            ],
+            Some((USDC_ARB, amount)),
+            "more than the nested calls approved",
+        );
+        refuse(
+            &[nested_call(DEPOSITORY, false, 0, &deposit_erc20(PAYER, USDC_ARB, amount, REQUEST))],
+            Some((USDC_ARB, amount)),
+            "no nested call approved",
+        );
+        // A call allowed to fail silently could strand the tokens just the same.
+        refuse(
+            &[
+                nested_call(USDC_ARB, true, 0, &approve(DEPOSITORY, amount)),
+                nested_call(DEPOSITORY, false, 0, &deposit_erc20(PAYER, USDC_ARB, amount, REQUEST)),
+            ],
+            Some((USDC_ARB, amount)),
+            "fail without saying so",
+        );
+        // And the pulled tokens may only land in the depository, not back with the router.
+        refuse(
+            &[nested_call(USDC_ARB, false, 0, &transfer(ROUTER, amount))],
+            Some((USDC_ARB, amount)),
+            "not Relay's depository",
+        );
+    }
+
+    #[test]
+    fn relay_roles_come_from_the_chain() {
         let chain: RelayChain = serde_json::from_value(json!({
             "id": 42161, "vmType": "evm",
             "contracts": { "multicall3": "0xca11bde05977b3631167028862be2a173976ca11", "relayReceiver": "",
@@ -1624,14 +1948,15 @@ mod tests {
             "protocol": { "v2": { "chainId": "arbitrum", "depository": "0x4cD00E387622C35bDDB9b4c962C136462338BC31" } }
         }))
         .unwrap();
-        let contracts = chain.relay_contracts();
-        assert!(contracts.contains(&DEPOSITORY.parse().unwrap()));
-        assert!(contracts.contains(&APPROVAL_PROXY.parse().unwrap()));
+        let roles = chain.relay_roles();
+        assert!(roles.depositories.contains(&DEPOSITORY.parse().unwrap()));
+        assert!(roles.approval_proxies.contains(&APPROVAL_PROXY.parse().unwrap()));
+        assert!(roles.routers.contains(&ROUTER.parse().unwrap()));
+        assert_eq!(roles.routers.len(), 1, "the same router listed twice is one router");
         assert!(
-            !contracts.contains(&"0xca11bde05977b3631167028862be2a173976ca11".parse().unwrap()),
+            !roles.contains(&"0xca11bde05977b3631167028862be2a173976ca11".parse().unwrap()),
             "multicall3 is not Relay's"
         );
-        assert_eq!(contracts.len(), 4);
     }
 
     #[test]
