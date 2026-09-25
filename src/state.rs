@@ -16,8 +16,10 @@ use crate::auth::privy::PrivyVerifier;
 use crate::chain::Registry;
 use crate::clients::engine::EngineClient;
 use crate::clients::indexer::IndexerClient;
+use crate::clients::relay::RelayClient;
 use crate::config::Config;
 use crate::deposit::feed;
+use crate::deposit::relay::RouteLimits;
 
 #[derive(Clone)]
 pub struct AppState(Arc<Inner>);
@@ -30,6 +32,9 @@ pub struct Inner {
     pub keys: KeyCache,
     pub indexer: IndexerClient,
     pub engine: EngineClient,
+    /// Relay, for payers paying with another token or chain (see `deposit::relay`).
+    pub relay: RelayClient,
+    pub relay_limits: RouteLimits,
     /// Client for app webhooks (separate pool and timeouts from upstream calls).
     pub webhook_http: reqwest::Client,
     pub factory: Address,
@@ -51,6 +56,8 @@ impl AppState {
         let keys = KeyCache::new(&config.api_keys);
         let indexer = IndexerClient::new(&config.indexer)?;
         let engine = EngineClient::new(&config.engine)?;
+        let relay = RelayClient::new(&config.relay)?;
+        let relay_limits = RouteLimits::new(&config.relay);
         let webhook_http = reqwest::Client::builder()
             .connect_timeout(Duration::from_millis(config.webhooks.connect_timeout_ms))
             .timeout(Duration::from_millis(config.webhooks.request_timeout_ms))
@@ -67,6 +74,8 @@ impl AppState {
             keys,
             indexer,
             engine,
+            relay,
+            relay_limits,
             webhook_http,
             factory,
             recovery,

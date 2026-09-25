@@ -2,6 +2,7 @@
 
 pub mod feed;
 pub mod pay;
+pub mod relay;
 pub mod request;
 pub mod routes;
 pub mod store;

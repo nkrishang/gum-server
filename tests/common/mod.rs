@@ -26,6 +26,7 @@ pub const PRIVY_APP_ID: &str = "test-app";
 pub const INDEXER_SECRET: &str = "indexer-secret";
 pub const ENGINE_SECRET: &str = "engine-secret";
 pub const ADMIN_TOKEN: &str = "admin-token";
+pub const RELAY_KEY: &str = "relay-key";
 pub const FACTORY: &str = "0x5FbDB2315678afecb367f032d93F642f64180aa3";
 pub const RECOVERY: &str = "0x3C44CdDdB6a900fa2b585dd299e03d12FA4293BC";
 pub const USDC: &str = "0xe7f1725E7734CE288F8367e1Bb143E90bb3F0512";
@@ -50,6 +51,8 @@ pub struct Harness {
     pub indexer: MockServer,
     pub engine: MockServer,
     pub app: MockServer,
+    /// Relay (api.relay.link).
+    pub relay: MockServer,
     shutdown: CancellationToken,
 }
 
@@ -91,6 +94,7 @@ impl Harness {
         let indexer = MockServer::start().await;
         let engine = MockServer::start().await;
         let app_mock = MockServer::start().await;
+        let relay = MockServer::start().await;
 
         let metrics = metrics_handle();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -116,6 +120,8 @@ impl Harness {
         config.outbox.workers = 4;
         config.reconciler.interval_secs = 3600;
         config.admin.token = ADMIN_TOKEN.into();
+        config.relay.base_url = relay.uri();
+        config.relay.api_key = RELAY_KEY.into();
         config.server.cors_origins = vec!["https://app.example".into()];
         config.chains = BTreeMap::from([(
             "anvil".to_owned(),
@@ -177,6 +183,7 @@ impl Harness {
             indexer,
             engine,
             app: app_mock,
+            relay,
             shutdown,
         })
     }

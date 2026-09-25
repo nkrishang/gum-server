@@ -19,7 +19,7 @@ use tower_http::trace::TraceLayer;
 use uuid::Uuid;
 
 use crate::auth::Admin;
-use crate::deposit::{DepositView, pay, routes as deposit, store};
+use crate::deposit::{DepositView, pay, relay, routes as deposit, store};
 use crate::error::ApiError;
 use crate::state::AppState;
 use crate::telemetry;
@@ -37,6 +37,13 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/deposit/user/{user_id}", get(deposit::list_for_user))
         // The payer's side of it (hosted pay page). No auth: the deposit id is the capability.
         .route("/v1/pay/{id}", get(pay::get))
+        // Paying it with any token on any chain, routed by Relay into the deposit's exact terms.
+        .route("/v1/pay/{id}/sources", get(relay::sources))
+        .route("/v1/pay/{id}/sources/tokens", get(relay::search_tokens))
+        .route("/v1/pay/{id}/prices", post(relay::prices))
+        .route("/v1/pay/{id}/quote", post(relay::quote))
+        .route("/v1/pay/{id}/routes/{request_id}", get(relay::route_status))
+        .route("/v1/pay/{id}/routes/{request_id}/transactions", post(relay::route_transaction))
         // Account and API key management (web UI).
         .route("/v1/account", get(account::get).patch(account::update))
         .route("/v1/account/api-key", post(account::create_key))
@@ -164,6 +171,7 @@ async fn readyz(State(state): State<AppState>) -> Response {
         "indexer": indexer,
         "engine": engine,
         "privy": state.privy.is_configured(),
+        "relay": state.relay.is_configured(),
     });
     let status = if db { StatusCode::OK } else { StatusCode::SERVICE_UNAVAILABLE };
     (status, Json(body)).into_response()

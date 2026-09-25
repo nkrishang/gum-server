@@ -2,6 +2,7 @@
 
 pub mod engine;
 pub mod indexer;
+pub mod relay;
 
 use std::time::Instant;
 

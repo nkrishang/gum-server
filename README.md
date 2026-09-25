@@ -225,6 +225,61 @@ transaction; each replica `LISTEN`s and wakes its waiting requests on commit, so
 within milliseconds whichever replica processed it. A notification lost while the listener
 reconnects only delays the page until its next poll.
 
+### Paying with any token (Relay)
+
+The pay page lets a payer pay with any token on any EVM chain [Relay](https://relay.link) supports,
+not only the deposit's own token and chain. gum-server asks Relay for the route and pins its
+destination itself, from the deposit, so the page only chooses what to pay *with*:
+
+```
+GET  /v1/pay/{id}/sources                     chains and tokens to pay from (Relay's EVM chains, the deposit's first)
+GET  /v1/pay/{id}/sources/tokens?q=&chain_id= Relay's verified tokens matching q
+POST /v1/pay/{id}/prices                      { "tokens": ["<chain_id>:<address>", …] } → USD prices (null: none)
+POST /v1/pay/{id}/quote                       { "user", "origin_chain_id", "origin_currency", "amount" } → a checked route
+GET  /v1/pay/{id}/routes/{request_id}         Relay's status: waiting / pending / submitted / success / failure / refund
+POST /v1/pay/{id}/routes/{request_id}/transactions   { "tx_hash", "chain_id" }: nudges Relay to index the origin tx (202)
+```
+
+No auth, like `GET /v1/pay/{id}`. A quote asks Relay (`POST /quote/v2`) for `EXACT_OUTPUT` of
+`amount` (at most `amount − confirmed_amount`) of the deposit's token on the deposit's chain, with
+the payment address as `recipient`, `refundTo` the payer (`refundOnOrigin`), surplus kept by the
+solver (`enableTrueExactOutput`), same-chain swaps solver-filled so they are exact too
+(`forceSolverExecution`), and `referrer` = `<relay.referrer>|<deposit id>`. Relay's answer is then
+checked before the page sees it ([`src/deposit/relay.rs`](src/deposit/relay.rs) `check_quote`):
+the recipient, the output token and chain, a guaranteed `minimumAmount ≥ amount`, every payment in
+the signed order (which must be there) to the payment address, every refund to the payer (or to the
+payment address in the deposit's token), and, for what the wallet actually signs, every step a plain
+transaction on the origin chain from the payer, to one of Relay's contracts on that chain (from
+`/chains`: depository, approval proxy, routers, receiver) or to the payer's token as an `approve` /
+`transfer` towards them for no more than the quoted input, with no `value` for a token and no more
+than the quoted input for the native currency. A mismatch is `502
+route_rejected` and logged; it never reaches a wallet. The response carries what leaves the wallet
+(`origin`), what arrives (`destination`, exactly `amount`), fees (`route_usd`, origin `gas`), a
+time estimate and the `steps` to send in order (usually an `approve` for exactly the input, then the
+deposit into Relay).
+
+Refused: a closed deposit (`409 closed`), one closing in under `relay.min_time_left_secs`
+(`409 closing`: a fill after `expires_at` would pay an expired address), more than is owed or the
+requested token itself (`400`), a chain Relay doesn't route from (`400 unsupported_chain`) or to
+(`409 route_unavailable`). Relay's refusals come back as `422` `no_route` / `amount_too_low` /
+`insufficient_liquidity` / `price_impact_too_high` / `blocked`; its outages as `503
+relay_unavailable`. Without `RELAY_API_KEY` the routes are off (`sources` says
+`available: false, reason: "disabled"`; `quote` is `503 relay_disabled`).
+
+Relay allows a key 50 quotes a minute: each replica stays under `relay.quotes_per_minute` (45) and
+one deposit gets `relay.quotes_per_deposit_per_minute` (12); over either is `429 rate_limited`. The
+other calls (chains, tokens, prices, route status; 200 a minute per key) are cached (`/chains` for
+`relay.chains_ttl_secs`, and 30 s of backoff after a failed refresh; searches and prices for a
+minute; a route's status for 2 s), and what misses the caches counts against
+`relay.reads_per_minute` (150) per replica; one deposit gets `relay.reads_per_deposit_per_minute`
+(60) of prices, searches and statuses. Run more than one replica, or expect more payers, and ask
+Relay for higher limits.
+
+The deposit itself knows nothing of Relay: the fill is an ordinary transfer of the deposit's token
+to the payment address from Relay's solver, which gum-indexer detects and gum-engine settles like
+any other. `cargo test --test relay -- --ignored` runs live quotes against api.relay.link for every
+supported chain (needs `RELAY_API_KEY`; nothing is signed or sent).
+
 ### App webhooks
 
 `POST <webhook_url>` with `content-type: application/json`, delivered at-least-once, in order per
@@ -335,7 +390,7 @@ Prometheus metrics: `gum_http_request_duration_seconds{route,method,status}`,
 `gum_deposits_created_total`, `gum_deposit_transitions_total{event}`, `gum_settlement_failures_total{code,revert}`,
 `gum_inbound_webhooks_total{source,outcome,type}`, `gum_outbox_pending`, `gum_outbox_dead`,
 `gum_outbox_lag_seconds`, `gum_outbox_jobs_total{kind,outcome}`,
-`gum_upstream_request_duration_seconds{service,op,outcome}`, `gum_app_webhook_deliveries_total{outcome}`,
+`gum_upstream_request_duration_seconds{service,op,outcome}`, `gum_relay_quotes_total{outcome}` (`ok`, `no_route`, `unavailable`, `shed`, `rejected_by_check`: alert on any of the last), `gum_app_webhook_deliveries_total{outcome}`,
 `gum_auth_total{method,outcome}`, `gum_db_errors_total`, `gum_deposits_paid`,
 `gum_deposits_paid_oldest_age_seconds`, `gum_outbox_due`, `gum_outbox_oldest_due_age_seconds`,
 `gum_panics_total`, `gum_task_restarts_total{task}`. Alert on any panic or task restart: the outbox,
@@ -364,6 +419,7 @@ reconciler, independently of the outbox itself.
 | `GUM_ADMIN__TOKEN` | Enables `/v1/admin` |
 | `GUM_SERVER__CORS_ORIGINS` | JSON array of browser origins allowed to call the API (the web UI), e.g. `["https://app.gum.money"]` |
 | `GUM_CHAINS__<NAME>__ENABLED` | `true` / `false`: offer a chain for new deposits. Arc ships `false` |
+| `RELAY_API_KEY` | Relay API key (dashboard.relay.link). Enables paying with any token on the pay page; server-side only |
 | `PORT`, `RUST_LOG` | |
 
 The chain/token registry in `config/default.toml` must mirror gum-indexer's; adding a chain or token
