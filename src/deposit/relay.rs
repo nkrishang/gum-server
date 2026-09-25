@@ -1215,7 +1215,11 @@ fn check_relay_call(call: &WalletCall, route: &Route, mut spend: Option<&mut Spe
         }
         // The receiver only forwards the transaction's value to Relay's solver; the value is
         // bounded with the rest of the route's.
-        FORWARD => {}
+        FORWARD => {
+            // Its argument is the multicall to run, so it must at least decode.
+            let mut r = Abi::new(args);
+            r.bytes().ok_or_else(|| refuse("has malformed forward arguments".into()))?;
+        }
         other => return Err(refuse(entrypoint(&other))),
     }
     Ok(())
@@ -1263,14 +1267,17 @@ fn check_nested_call(
                 let slot = flow.granted.entry(spender).or_default();
                 *slot = slot.checked_add(amount).ok_or_else(|| refuse("nested allowances overflow".into()))?;
             }
+        } else if flow.is_some() {
+            // As the pull's way out, a raw transfer cannot be trusted: a token may return false
+            // instead of reverting, leaving what it was to move in the router for anyone to sweep.
+            // The depository draws with `safeTransferFrom`, which cannot fail so quietly.
+            return Err(refuse(format!(
+                "nests a plain transfer to {spender:#x}, which a misbehaving token could silently not make"
+            )));
         } else {
             // And the router's tokens may only go where deposits are held.
             if !want.relay_roles.depositories.contains(&spender) {
                 return Err(refuse(format!("nests a transfer to {spender:#x}, which is not Relay's depository")));
-            }
-            if let Some(flow) = flow {
-                flow.consumed =
-                    flow.consumed.checked_add(amount).ok_or_else(|| refuse("nested transfers overflow".into()))?;
             }
         }
         return Ok(());
@@ -1930,11 +1937,12 @@ mod tests {
             Some((USDC_ARB, amount)),
             "fail without saying so",
         );
-        // And the pulled tokens may only land in the depository, not back with the router.
+        // And the pulled tokens may not leave by a raw transfer: a token that returns false
+        // instead of reverting would strand them in the router, where anyone can sweep them.
         refuse(
             &[nested_call(USDC_ARB, false, 0, &transfer(ROUTER, amount))],
             Some((USDC_ARB, amount)),
-            "not Relay's depository",
+            "silently not make",
         );
     }
 
