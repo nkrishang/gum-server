@@ -445,6 +445,16 @@ pub struct Expected {
     /// Relay's contracts on the origin chain (from `/chains`): the only addresses a route's
     /// transactions may call, approve or transfer to, besides the origin token itself.
     pub relay_contracts: Vec<Address>,
+    /// The origin token's decimals, from Relay's own token lists — not from the quote, whose
+    /// decimals decide what the route is worth on screen while the calldata spends base units.
+    pub origin_decimals: u8,
+    /// The deposit token's decimals, from our own record of the deposit.
+    pub token_decimals: u8,
+    /// Relay's names for the origin chain (from `/chains`), lowercased: signed orders spell chains
+    /// by name.
+    pub origin_chain_names: Vec<String>,
+    /// Relay's names for the deposit's chain, lowercased.
+    pub destination_chain_names: Vec<String>,
 }
 
 pub async fn quote(
@@ -480,6 +490,25 @@ pub async fn quote(
         ));
     };
     expected.relay_contracts = origin.relay_contracts();
+    expected.origin_chain_names = chain_names(origin);
+    expected.destination_chain_names =
+        chains.iter().find(|c| c.id == expected.destination_chain_id).map(chain_names).unwrap_or_default();
+    expected.origin_decimals = match chain_token_decimals(origin, expected.origin_currency) {
+        Some(decimals) => decimals,
+        // Not among the chain's listed tokens: Relay's verified-token search knows it, or the
+        // quote's own decimals would go unverified — and the quote could spend far more than it
+        // shows.
+        None => {
+            state.relay_limits.read(deposit.id)?;
+            let term = format!("{:#x}", expected.origin_currency);
+            let found =
+                state.relay.search_currencies(&[expected.origin_chain_id], &term, 5).await.map_err(relay_error)?;
+            let decimals = found.iter().find(|t| t.address.eq_ignore_ascii_case(&term)).map(|t| t.decimals);
+            decimals.ok_or_else(|| {
+                ApiError::invalid("that token is not known to Relay on this chain; it can't be quoted safely")
+            })?
+        }
+    };
     if !can_receive(&chains, expected.destination_chain_id) {
         return Err(ApiError::conflict("route_unavailable", "Relay does not route to this payment's chain right now"));
     }
@@ -554,7 +583,36 @@ fn expected(deposit: &Deposit, body: &QuoteBody) -> Result<Expected, ApiError> {
         recipient: deposit.payment_address(),
         amount,
         relay_contracts: Vec::new(),
+        origin_decimals: 0,
+        token_decimals: deposit.token_decimals as u8,
+        origin_chain_names: Vec::new(),
+        destination_chain_names: Vec::new(),
     })
+}
+
+/// A chain's names as Relay's signed orders spell it: the slug and the display name, lowercased.
+fn chain_names(c: &RelayChain) -> Vec<String> {
+    let mut names = vec![c.name.to_ascii_lowercase()];
+    if !c.display_name.is_empty() {
+        names.push(c.display_name.to_ascii_lowercase());
+    }
+    names.sort();
+    names.dedup();
+    names
+}
+
+/// The decimals of one of Relay's own tokens on a chain: the native currency for the zero address,
+/// otherwise its listing among the chain's tokens. `None` for a token Relay doesn't list there.
+fn chain_token_decimals(c: &RelayChain, currency: Address) -> Option<u8> {
+    if currency.is_zero() {
+        return Some(c.currency.as_ref().map(|n| n.decimals).unwrap_or(18));
+    }
+    let raw = format!("{currency:#x}");
+    c.featured_tokens
+        .iter()
+        .chain(&c.erc20_currencies)
+        .find(|t| t.address.eq_ignore_ascii_case(&raw))
+        .map(|t| t.decimals)
 }
 
 fn same_address(raw: &str, want: Address) -> bool {
@@ -595,6 +653,9 @@ pub fn check_quote(quote: &Quote, want: &Expected) -> Result<RouteQuote, String>
         return Err(format!("request id {request_id:?} is not a 32-byte hex id"));
     }
     let d = &quote.details;
+    if !same_address(&d.sender, want.user) {
+        return Err(format!("sender {} is not the payer", d.sender));
+    }
     if !same_address(&d.recipient, want.recipient) {
         return Err(format!("recipient {} is not the payment address", d.recipient));
     }
@@ -605,8 +666,17 @@ pub fn check_quote(quote: &Quote, want: &Expected) -> Result<RouteQuote, String>
             out.currency.address, out.currency.chain_id
         ));
     }
-    let guaranteed = base_units(out.minimum_amount.as_deref()).or_else(|| base_units(Some(&out.amount)));
-    if guaranteed.is_none_or(|g| g < want.amount) {
+    if out.currency.decimals != want.token_decimals {
+        return Err(format!(
+            "pays in {} decimals, not the deposit token's {}",
+            out.currency.decimals, want.token_decimals
+        ));
+    }
+    // The guarantee must be a real one: a missing or malformed `minimumAmount` is a refusal, not a
+    // fall back to the indicative amount.
+    let guaranteed = base_units(out.minimum_amount.as_deref())
+        .ok_or_else(|| format!("guarantees {:?}, which is no number of base units", out.minimum_amount))?;
+    if guaranteed < want.amount {
         return Err(format!("guarantees {:?}, less than {}", out.minimum_amount, want.amount));
     }
     let input = &d.currency_in;
@@ -616,22 +686,32 @@ pub fn check_quote(quote: &Quote, want: &Expected) -> Result<RouteQuote, String>
             input.currency.address, input.currency.chain_id
         ));
     }
+    if input.currency.decimals != want.origin_decimals {
+        return Err(format!(
+            "takes {} decimals on the origin chain, not the {} Relay lists for it",
+            input.currency.decimals, want.origin_decimals
+        ));
+    }
     let Some(input_amount) = base_units(Some(&input.amount)) else {
         return Err(format!("input amount {:?} is not base units", input.amount));
     };
     // Every route we ask for is solver-filled, so it comes with the order the solver signs.
-    let Some(order) = quote.protocol.as_ref().and_then(|p| p.pointer("/v2/orderData")) else {
-        return Err("no signed order (protocol.v2.orderData) to check".into());
-    };
+    let order = quote
+        .protocol
+        .as_ref()
+        .and_then(|p| p.pointer("/v2/orderData"))
+        .filter(|o| o.is_object())
+        .ok_or("no signed order (protocol.v2.orderData) to check")?;
     check_order(order, want)?;
 
+    let mut spend = Spend::default();
     let mut steps = Vec::new();
     for step in &quote.steps {
         if step.kind != "transaction" {
             return Err(format!("step {} is a {} step; only transactions are supported", step.id, step.kind));
         }
         for item in &step.items {
-            steps.push(check_step(&step.id, &step.description, &item.data, want, input_amount)?);
+            steps.push(check_step(&step.id, &step.description, &item.data, want, input_amount, &mut spend)?);
         }
     }
     if steps.is_empty() {
@@ -641,11 +721,18 @@ pub fn check_quote(quote: &Quote, want: &Expected) -> Result<RouteQuote, String>
     // input for the native currency.
     let mut value = U256::ZERO;
     for step in &steps {
-        value = value.saturating_add(base_units(Some(&step.value)).unwrap_or(U256::MAX));
+        let step_value = base_units(Some(&step.value)).unwrap_or(U256::MAX);
+        value = value.checked_add(step_value).unwrap_or(U256::MAX);
     }
     let limit = if want.origin_currency.is_zero() { input_amount } else { U256::ZERO };
     if value > limit {
         return Err(format!("the steps send {value} wei of value; the quote takes {limit}"));
+    }
+    // And the token it may take — transfers now, plus what approvals let Relay draw down — is the
+    // quoted input, across the whole route, not just each step on its own.
+    let taken = spend.exposure();
+    if taken > input_amount {
+        return Err(format!("the steps take {taken} from the wallet; the quote is for {input_amount}"));
     }
 
     let fees = quote.fees.as_ref();
@@ -669,32 +756,85 @@ pub fn check_quote(quote: &Quote, want: &Expected) -> Result<RouteQuote, String>
     })
 }
 
-/// The signed order behind the route (`protocol.v2.orderData`), when Relay includes it.
-fn check_order(order: &Value, want: &Expected) -> Result<(), String> {
-    if let Some(payments) = order.pointer("/output/payments").and_then(Value::as_array) {
-        let mut total = U256::ZERO;
-        for p in payments {
-            let recipient = p.get("recipient").and_then(Value::as_str).unwrap_or_default();
-            let currency = p.get("currency").and_then(Value::as_str).unwrap_or_default();
-            if !same_address(recipient, want.recipient) || !same_address(currency, want.token) {
-                return Err(format!("the order pays {currency} to {recipient}"));
-            }
-            total += base_units(p.get("minimumAmount").and_then(Value::as_str)).unwrap_or_default();
-        }
-        if total < want.amount {
-            return Err(format!("the order guarantees {total}, less than {}", want.amount));
-        }
+/// Is this signed-order chain field the given chain? Relay's orders spell chains by name; a number
+/// is also accepted. Anything that names neither the origin nor the destination is a refusal.
+fn is_chain(field: Option<&Value>, id: u64, names: &[String]) -> bool {
+    let Some(field) = field else { return false };
+    if field.as_u64() == Some(id) {
+        return true;
     }
-    // Refunds go to the payer, or (Relay's fallback) to the payment address in the deposit's own
-    // token, which is where it counts; never anywhere else.
-    for input in order.get("inputs").and_then(Value::as_array).into_iter().flatten() {
-        for refund in input.get("refunds").and_then(Value::as_array).into_iter().flatten() {
+    let Some(spelled) = field.as_str().map(str::trim) else { return false };
+    if let Ok(n) = spelled.parse::<u64>() {
+        return n == id;
+    }
+    names.iter().any(|name| name.as_str() == spelled.to_ascii_lowercase())
+}
+
+/// The signed order behind the route (`protocol.v2.orderData`). Its terms are the route's: it pays
+/// the payment address the deposit's token on the deposit's chain, at least `amount` guaranteed;
+/// it takes the quoted input on the origin chain; and refunds go to the payer, or (Relay's
+/// fallback) to the payment address in the deposit's own token. A missing or malformed term is a
+/// refusal — never taken on faith.
+fn check_order(order: &Value, want: &Expected) -> Result<(), String> {
+    let output = order.get("output").ok_or("the signed order has no output")?;
+    let payments =
+        output.get("payments").and_then(Value::as_array).ok_or("the signed order has no payments to check")?;
+    if payments.is_empty() {
+        return Err("the signed order pays nothing".into());
+    }
+    if !is_chain(output.get("chainId"), want.destination_chain_id, &want.destination_chain_names) {
+        return Err(format!("the signed order settles on {:?}", output.get("chainId")));
+    }
+    let mut total = U256::ZERO;
+    for p in payments {
+        let recipient = p.get("recipient").and_then(Value::as_str).unwrap_or_default();
+        let currency = p.get("currency").and_then(Value::as_str).unwrap_or_default();
+        if !same_address(recipient, want.recipient) || !same_address(currency, want.token) {
+            return Err(format!("the order pays {currency} to {recipient}"));
+        }
+        let minimum = p
+            .get("minimumAmount")
+            .and_then(Value::as_str)
+            .and_then(|s| base_units(Some(s)))
+            .ok_or("a payment of the signed order has no minimumAmount")?;
+        total = total.checked_add(minimum).ok_or("the signed order's payments overflow")?;
+    }
+    if total < want.amount {
+        return Err(format!("the order guarantees {total}, less than {}", want.amount));
+    }
+
+    let inputs = order.get("inputs").and_then(Value::as_array).ok_or("the signed order has no inputs")?;
+    for input in inputs {
+        let payment =
+            input.get("payment").filter(|p| p.is_object()).ok_or("an input of the signed order has no payment")?;
+        let currency = payment.get("currency").and_then(Value::as_str).unwrap_or_default();
+        if !same_address(currency, want.origin_currency) {
+            return Err(format!("the order takes {currency}, not what the payer chose"));
+        }
+        if !is_chain(payment.get("chainId"), want.origin_chain_id, &want.origin_chain_names) {
+            return Err(format!("the order takes {currency} on {:?}", payment.get("chainId")));
+        }
+        if base_units(payment.get("amount").and_then(Value::as_str)).is_none() {
+            return Err("an input of the signed order has no amount".into());
+        }
+        // Refunds go to the payer, or (Relay's fallback) to the payment address in the deposit's
+        // own token, which is where it counts; never anywhere else, and never on a chain that is
+        // neither the origin nor the destination.
+        let refunds =
+            input.get("refunds").and_then(Value::as_array).ok_or("an input of the signed order has no refunds")?;
+        for refund in refunds {
             let to = refund.get("recipient").and_then(Value::as_str).unwrap_or_default();
             let currency = refund.get("currency").and_then(Value::as_str).unwrap_or_default();
             let to_payer = same_address(to, want.user);
             let to_deposit = same_address(to, want.recipient) && same_address(currency, want.token);
-            if !to_payer && !to_deposit {
-                return Err(format!("the order refunds {currency} to {to}, neither the payer nor this payment"));
+            let on_origin = is_chain(refund.get("chainId"), want.origin_chain_id, &want.origin_chain_names);
+            let on_destination =
+                is_chain(refund.get("chainId"), want.destination_chain_id, &want.destination_chain_names);
+            if !(on_origin && to_payer) && !(on_destination && to_deposit) {
+                return Err(format!(
+                    "the order refunds {currency} to {to} on {:?}, neither the payer's nor this payment's",
+                    refund.get("chainId")
+                ));
             }
         }
     }
@@ -706,12 +846,330 @@ fn check_order(order: &Value, want: &Expected) -> Result<(), String> {
 const APPROVE: [u8; 4] = [0x09, 0x5e, 0xa7, 0xb3];
 const TRANSFER: [u8; 4] = [0xa9, 0x05, 0x9c, 0xbb];
 
+// ---------------------------------------------------------------------------------------------
+// Relay's contracts: what their calldata may do
+// ---------------------------------------------------------------------------------------------
+//
+// Relay's own contracts are not safe to call with arbitrary calldata: their entrypoints forward
+// nested calls, pull tokens by allowance and choose refund recipients. Every entrypoint a route may
+// use is decoded here and held against the route's terms; anything the checks don't decode is
+// refused, so a new entrypoint fails closed until it is understood.
+//
+// Signatures from Relay's periphery (relay-protocol/relay-periphery, relay-protocol/
+// relay-depository), verified against their keccak selectors in the tests.
+const DEPOSIT_ERC20: [u8; 4] = [0xe8, 0x01, 0x79, 0x52]; // depositErc20(address,address,uint256,bytes32)
+const DEPOSIT_ERC20_ALL: [u8; 4] = [0x5a, 0x1e, 0xe3, 0xac]; // depositErc20(address,address,bytes32)
+const DEPOSIT_NATIVE: [u8; 4] = [0x49, 0x29, 0x0c, 0x1c]; // depositNative(address,bytes32)
+const MULTICALL: [u8; 4] = [0xcd, 0x6e, 0x13, 0xf7]; // multicall((address,bool,uint256,bytes)[],address,address,bytes)
+const MULTICALL_V2: [u8; 4] = [0x30, 0xbe, 0x55, 0x67]; // multicall((address,bool,uint256,bytes)[],address,address)
+const TRANSFER_AND_MULTICALL: [u8; 4] = [0xf9, 0xe4, 0xba, 0xb4]; // transferAndMulticall(address[],uint256[],(address,bool,uint256,bytes)[],address,address,bytes)
+const TRANSFER_AND_MULTICALL_V2: [u8; 4] = [0x30, 0x87, 0x50, 0x56]; // transferAndMulticall(address[],uint256[],(address,bool,uint256,bytes)[],address,address)
+const FORWARD: [u8; 4] = [0xd9, 0x48, 0xd4, 0x68]; // forward(bytes)
+
+/// What a route may yet take from the payer's wallet in the token it quoted: token moved out at
+/// once, plus approvals Relay can still draw down. Held against the quoted input across the whole
+/// route — a route that approves and then spends spends once, and a route that spends twice from
+/// one input is refused.
+#[derive(Default)]
+struct Spend {
+    pulled: U256,
+    /// Allowance granted by this route, still unspent, per spender.
+    allowances: BTreeMap<Address, U256>,
+}
+
+impl Spend {
+    /// An approval. A later approval of the same spender replaces it, so the largest wins.
+    fn grant(&mut self, spender: Address, amount: U256) {
+        let slot = self.allowances.entry(spender).or_default();
+        if amount > *slot {
+            *slot = amount;
+        }
+    }
+
+    /// A draw-down of the payer's allowance by a Relay contract (a deposit by `depositErc20`, or a
+    /// pull through the approval proxy). The whole amount leaves the wallet — what an approval of
+    /// this route covered, and what a pre-existing one did — so it all counts, and the allowance
+    /// that was drawn down stops counting.
+    fn pull(&mut self, spender: Address, amount: U256) -> Result<(), String> {
+        if let Some(slot) = self.allowances.get_mut(&spender) {
+            let covered = (*slot).min(amount);
+            *slot -= covered;
+        }
+        self.pulled = self.pulled.checked_add(amount).ok_or("the route's token spending overflows")?;
+        Ok(())
+    }
+
+    /// A plain `transfer` from the wallet.
+    fn transfer(&mut self, amount: U256) -> Result<(), String> {
+        self.pulled = self.pulled.checked_add(amount).ok_or("the route's token spending overflows")?;
+        Ok(())
+    }
+
+    /// Everything the route could still take: what moved, plus every allowance it granted.
+    fn exposure(&self) -> U256 {
+        self.allowances.values().fold(self.pulled, |sum, a| sum.saturating_add(*a))
+    }
+}
+
+/// Reads ABI-encoded words, bounds-checked throughout; anything odd reads as nothing.
+struct Abi<'a> {
+    bytes: &'a [u8],
+    /// Where this reader's dynamic offsets are relative to.
+    base: usize,
+    pos: usize,
+}
+
+/// Bounds on decoded calldata: a route's funding calls are small.
+const MAX_ABI_OFFSET: usize = 1 << 20;
+const MAX_ABI_BYTES: usize = 8 << 10;
+const MAX_ABI_ITEMS: usize = 8;
+
+impl<'a> Abi<'a> {
+    fn new(bytes: &'a [u8]) -> Self {
+        Self { bytes, base: 0, pos: 0 }
+    }
+
+    fn at(bytes: &'a [u8], base: usize, pos: usize) -> Self {
+        Self { bytes, base, pos }
+    }
+
+    fn word(&mut self) -> Option<&'a [u8; 32]> {
+        let word = self.bytes.get(self.pos..self.pos.checked_add(32)?)?.try_into().ok()?;
+        self.pos = self.pos.checked_add(32)?;
+        Some(word)
+    }
+
+    fn address(&mut self) -> Option<Address> {
+        let word = self.word()?;
+        if word[..12].iter().any(|b| *b != 0) {
+            return None;
+        }
+        Some(Address::from_slice(&word[12..]))
+    }
+
+    fn uint(&mut self) -> Option<U256> {
+        Some(U256::from_be_slice(self.word()?))
+    }
+
+    fn offset(&mut self) -> Option<usize> {
+        usize::try_from(self.uint()?).ok().filter(|off| *off <= MAX_ABI_OFFSET)
+    }
+
+    /// A dynamic `bytes` argument: an offset to a length and its data.
+    fn bytes(&mut self) -> Option<&'a [u8]> {
+        let at = self.base.checked_add(self.offset()?)?;
+        let mut r = Abi::at(self.bytes, at, at);
+        let len = r.uint()?.try_into().ok()?;
+        if len > MAX_ABI_BYTES {
+            return None;
+        }
+        self.bytes.get(at.checked_add(32)?..at.checked_add(32)?.checked_add(len)?)
+    }
+
+    /// A dynamic array of statically-sized items (`address[]`, `uint256[]`).
+    fn static_items<T>(&mut self, item: impl Fn(&mut Self) -> Option<T>) -> Option<Vec<T>> {
+        let at = self.base.checked_add(self.offset()?)?;
+        let mut r = Abi::at(self.bytes, at, at);
+        let len: usize = r.uint()?.try_into().ok()?;
+        if len > MAX_ABI_ITEMS {
+            return None;
+        }
+        // Elements' offsets are relative to the position after the length.
+        r.base = r.pos;
+        let mut out = Vec::with_capacity(len);
+        for _ in 0..len {
+            out.push(item(&mut r)?);
+        }
+        Some(out)
+    }
+
+    /// Relay's nested calls, `(address target, bool allowFailure, uint256 value, bytes callData)[]`.
+    fn nested_calls(&mut self) -> Option<Vec<(Address, U256, &'a [u8])>> {
+        self.static_items(|r| {
+            let at = r.base.checked_add(r.offset()?)?;
+            let mut el = Abi::at(r.bytes, at, at);
+            let target = el.address()?;
+            let _allow_failure = el.uint()?;
+            let value = el.uint()?;
+            let data = el.bytes()?;
+            Some((target, value, data))
+        })
+    }
+}
+
+/// A call a route makes: to one of Relay's contracts, or to the payer's token.
+struct WalletCall<'a> {
+    to: Address,
+    calldata: &'a [u8],
+    /// Wei the wallet attaches.
+    value: U256,
+}
+
+/// A call to one of Relay's contracts. The payer-facing entrypoints are known and decoded; each is
+/// checked for what it debits from the wallet, who it can pay back, and what it nests. `spend` is
+/// the wallet's tab, kept only for calls the wallet itself makes (`Some`); a Relay contract's own
+/// nested calls spend what the transaction brought it — already on the tab at the pull — so they
+/// are bounded per call but debited nowhere.
+fn check_relay_call(
+    id: &str,
+    call: &WalletCall,
+    want: &Expected,
+    input_amount: U256,
+    mut spend: Option<&mut Spend>,
+    depth: u8,
+) -> Result<(), String> {
+    let to = call.to;
+    let tx_value = call.value;
+    let calldata = call.calldata;
+    let entrypoint =
+        |selector: &[u8; 4]| format!("makes a call the checks don't decode ({:#x}{}…)", to, hex::encode(selector));
+    let (head, args) =
+        calldata.split_at_checked(4).ok_or_else(|| format!("step {id} calls {to:#x} with no selector"))?;
+    let selector: &[u8; 4] = head.try_into().map_err(|_| format!("step {id} has malformed calldata"))?;
+    let refuse = |what: String| format!("step {id} {what}");
+
+    match *selector {
+        // A deposit: Relay's depository draws the quoted input down from the payer's allowance to
+        // it, for the order the route was quoted for.
+        DEPOSIT_ERC20 => {
+            let mut r = Abi::new(args);
+            let depositor = r.address().ok_or_else(|| refuse("has malformed depositErc20 arguments".into()))?;
+            let token = r.address().ok_or_else(|| refuse("has malformed depositErc20 arguments".into()))?;
+            let amount = r.uint().ok_or_else(|| refuse("has malformed depositErc20 arguments".into()))?;
+            if !depositor.is_zero() && depositor != want.user {
+                return Err(refuse(format!("deposits as {depositor:#x}, not the payer")));
+            }
+            if token != want.origin_currency {
+                return Err(refuse(format!("deposits {token:#x}, not the token being paid with")));
+            }
+            if amount > input_amount {
+                return Err(refuse(format!("deposits {amount}, more than the quoted {input_amount}")));
+            }
+            if let Some(spend) = spend.as_deref_mut() {
+                spend.pull(to, amount).map_err(refuse)?;
+            }
+        }
+        // This one draws down the wallet's whole remaining allowance: never bounded by a quote.
+        DEPOSIT_ERC20_ALL => {
+            return Err(refuse("deposits by the wallet's whole allowance, which no quote bounds".into()));
+        }
+        // A native deposit: its value is the transaction's, bounded with the rest of the route's.
+        DEPOSIT_NATIVE => {
+            let mut r = Abi::new(args);
+            let depositor = r.address().ok_or_else(|| refuse("has malformed depositNative arguments".into()))?;
+            if !depositor.is_zero() && depositor != want.user {
+                return Err(refuse(format!("deposits as {depositor:#x}, not the payer")));
+            }
+        }
+        // The router and the approval proxy run the route's swap as nested calls; the proxy first
+        // pulls the quoted input from the wallet, through the allowance to it.
+        MULTICALL | MULTICALL_V2 | TRANSFER_AND_MULTICALL | TRANSFER_AND_MULTICALL_V2 => {
+            let pulls = matches!(*selector, TRANSFER_AND_MULTICALL | TRANSFER_AND_MULTICALL_V2);
+            let mut r = Abi::new(args);
+            let (tokens, amounts) = if pulls {
+                let tokens = r
+                    .static_items(|r| r.address())
+                    .ok_or_else(|| refuse("has malformed transferAndMulticall arguments".into()))?;
+                let amounts = r
+                    .static_items(|r| r.uint())
+                    .ok_or_else(|| refuse("has malformed transferAndMulticall arguments".into()))?;
+                (Some(tokens), Some(amounts))
+            } else {
+                (None, None)
+            };
+            let calls = r.nested_calls().ok_or_else(|| refuse("has malformed multicall arguments".into()))?;
+            let refund_to = r.address().ok_or_else(|| refuse("has malformed multicall arguments".into()))?;
+            let nft_recipient = r.address().ok_or_else(|| refuse("has malformed multicall arguments".into()))?;
+            if !refund_to.is_zero() && refund_to != want.user {
+                return Err(refuse(format!("sends its surplus to {refund_to:#x}, not the payer")));
+            }
+            if !nft_recipient.is_zero() && nft_recipient != want.user {
+                return Err(refuse(format!("sends its claims to {nft_recipient:#x}, not the payer")));
+            }
+            if let (Some(tokens), Some(amounts)) = (tokens, amounts) {
+                if tokens.len() != amounts.len() {
+                    return Err(refuse("pulls tokens and amounts of different lengths".into()));
+                }
+                for (token, amount) in tokens.into_iter().zip(amounts) {
+                    if token != want.origin_currency {
+                        return Err(refuse(format!("pulls {token:#x}, not the token being paid with")));
+                    }
+                    if amount > input_amount {
+                        return Err(refuse(format!("pulls {amount}, more than the quoted {input_amount}")));
+                    }
+                    if let Some(spend) = spend.as_deref_mut() {
+                        spend.pull(to, amount).map_err(refuse)?;
+                    }
+                }
+            }
+            // The nested calls move what this transaction brought: at most the wallet's value, to
+            // Relay's contracts or through the quoted token, never anywhere else.
+            let mut nested_value = U256::ZERO;
+            for (target, value, data) in calls {
+                nested_value = nested_value.checked_add(value).ok_or_else(|| refuse("nested calls overflow".into()))?;
+                if nested_value > tx_value {
+                    return Err(refuse("nests calls worth more than the transaction's value".into()));
+                }
+                check_nested_call(id, target, data, want, input_amount, depth).map_err(refuse)?;
+            }
+        }
+        // The receiver only forwards the transaction's value to Relay's solver; the value is
+        // bounded with the rest of the route's.
+        FORWARD => {}
+        other => return Err(refuse(entrypoint(&other))),
+    }
+    Ok(())
+}
+
+/// A call nested in a Relay router's multicall, run by the router. It can only move what the
+/// transaction brought the router — counted on the wallet's tab at the pull — so each call is
+/// bounded by the quoted input, and nothing here debits the wallet twice.
+fn check_nested_call(
+    id: &str,
+    target: Address,
+    data: &[u8],
+    want: &Expected,
+    input_amount: U256,
+    depth: u8,
+) -> Result<(), String> {
+    let refuse = |what: String| format!("step {id} {what}");
+    if depth > 1 {
+        return Err(refuse("nests calls within nested calls".into()));
+    }
+    if !want.origin_currency.is_zero() && target == want.origin_currency {
+        let (selector, args) =
+            data.split_at_checked(4).ok_or_else(|| refuse("nests a call on the token with no selector".into()))?;
+        if *selector != APPROVE && *selector != TRANSFER {
+            return Err(refuse(format!("nests an unexpected call on the payer's token ({})", hex::encode(selector))));
+        }
+        if args.len() < 64 {
+            return Err(refuse("nests a call on the token with truncated arguments".into()));
+        }
+        let spender = Address::from_slice(&args[12..32]);
+        if !want.relay_contracts.contains(&spender) {
+            return Err(refuse(format!("nests a call towards {spender:#x}, which is not Relay's")));
+        }
+        // The router's own allowance and transfers, bounded by the quote.
+        let amount = U256::from_be_slice(&args[32..64]);
+        if amount > input_amount {
+            return Err(refuse(format!("nests a call for {amount}, more than the quoted {input_amount}")));
+        }
+        return Ok(());
+    }
+    if want.relay_contracts.contains(&target) {
+        let nested = WalletCall { to: target, calldata: data, value: U256::ZERO };
+        return check_relay_call(id, &nested, want, input_amount, None, depth + 1);
+    }
+    Err(refuse(format!("nests a call to {target:#x}, which is neither Relay's nor the payer's token")))
+}
+
 fn check_step(
     id: &str,
     description: &str,
     data: &Value,
     want: &Expected,
     input_amount: U256,
+    spend: &mut Spend,
 ) -> Result<RouteStep, String> {
     let field = |name: &str| data.get(name).and_then(Value::as_str).unwrap_or_default();
     let chain_id = data.get("chainId").and_then(Value::as_u64).unwrap_or_default();
@@ -728,6 +1186,12 @@ fn check_step(
         return Err(format!("step {id} has malformed calldata"));
     }
     let bytes = hex::decode(&calldata[2..]).map_err(|_| format!("step {id} has malformed calldata"))?;
+    let value = match data.get("value") {
+        None | Some(Value::Null) => "0".to_owned(),
+        Some(Value::String(s)) if base_units(Some(s)).is_some() => s.trim().to_owned(),
+        Some(other) => return Err(format!("step {id} has value {other}")),
+    };
+    let value_wei = base_units(Some(&value)).unwrap_or(U256::MAX);
     if !want.origin_currency.is_zero() && to == want.origin_currency {
         // A call on the payer's token: an allowance or a transfer to Relay, for no more than the
         // quoted input. (A deposit by transfer appends Relay's order id after the arguments.)
@@ -744,14 +1208,18 @@ fn check_step(
         if amount > input_amount {
             return Err(format!("step {id} approves or transfers {amount}, more than the quoted {input_amount}"));
         }
-    } else if !want.relay_contracts.contains(&to) {
+        if selector == APPROVE {
+            spend.grant(target, amount);
+        } else {
+            spend.transfer(amount).map_err(|e| format!("step {id} {e}"))?;
+        }
+    } else if want.relay_contracts.contains(&to) {
+        // A call on one of Relay's contracts: decoded and held against the route's terms.
+        let call = WalletCall { to, calldata: &bytes, value: value_wei };
+        check_relay_call(id, &call, want, input_amount, Some(spend), 0)?;
+    } else {
         return Err(format!("step {id} calls {to:#x}, which is not one of Relay's contracts on the origin chain"));
     }
-    let value = match data.get("value") {
-        None | Some(Value::Null) => "0".to_owned(),
-        Some(Value::String(s)) if base_units(Some(s)).is_some() => s.trim().to_owned(),
-        Some(other) => return Err(format!("step {id} has value {other}")),
-    };
     Ok(RouteStep {
         id: id.to_owned(),
         description: description.to_owned(),
@@ -895,6 +1363,25 @@ mod tests {
         format!("0x095ea7b3{:0>64}{amount:064x}", spender.trim_start_matches("0x"))
     }
 
+    fn transfer(to: &str, amount: u64) -> String {
+        format!("0xa9059cbb{:0>64}{amount:064x}", to.trim_start_matches("0x"))
+    }
+
+    /// `depositErc20(depositor, token, amount, id)`, as Relay's depository takes it.
+    fn deposit_erc20(depositor: &str, token: &str, amount: u64, id: &str) -> String {
+        format!(
+            "0xe8017952{:0>64}{:0>64}{amount:064x}{}",
+            depositor.trim_start_matches("0x"),
+            token.trim_start_matches("0x"),
+            id.trim_start_matches("0x")
+        )
+    }
+
+    /// `depositNative(depositor, id)`.
+    fn deposit_native(depositor: &str, id: &str) -> String {
+        format!("0x49290c1c{:0>64}{}", depositor.trim_start_matches("0x"), id.trim_start_matches("0x"))
+    }
+
     fn want() -> Expected {
         Expected {
             user: PAYER.parse().unwrap(),
@@ -905,6 +1392,10 @@ mod tests {
             recipient: PAYMENT.parse().unwrap(),
             amount: U256::from(2_500_000u64),
             relay_contracts: vec![DEPOSITORY.parse().unwrap(), APPROVAL_PROXY.parse().unwrap()],
+            origin_decimals: 6,
+            token_decimals: 6,
+            origin_chain_names: vec!["arbitrum".into()],
+            destination_chain_names: vec!["base".into()],
         }
     }
 
@@ -928,7 +1419,7 @@ mod tests {
                   "description": "Depositing funds to the relayer to execute the swap for USDC", "kind": "transaction",
                   "items": [{ "status": "incomplete",
                       "data": { "from": "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045", "to": DEPOSITORY,
-                                "data": "0xe8017952aa", "value": "0", "chainId": 42161 },
+                                "data": deposit_erc20(PAYER, USDC_ARB, 2_526_643, REQUEST), "value": "0", "chainId": 42161 },
                       "check": { "endpoint": format!("/intents/status/v3?requestId={REQUEST}"), "method": "GET" } }] }
             ],
             "fees": {
@@ -982,10 +1473,13 @@ mod tests {
             assert!(err.contains(why), "{err} (expected {why})");
         };
         let other = "0x0000000000000000000000000000000000000bad";
+        refuse(&|q| q["details"]["sender"] = json!(other), "is not the payer");
         refuse(&|q| q["details"]["recipient"] = json!(other), "not the payment address");
         refuse(&|q| q["details"]["currencyOut"]["currency"]["address"] = json!(other), "not the deposit's token");
         refuse(&|q| q["details"]["currencyOut"]["currency"]["chainId"] = json!(1), "not the deposit's token");
-        refuse(&|q| q["details"]["currencyOut"]["minimumAmount"] = json!("2499999"), "less than 2500000");
+        refuse(&|q| q["details"]["currencyOut"]["currency"]["decimals"] = json!(18), "not the deposit token's");
+        refuse(&|q| q["details"]["currencyOut"]["minimumAmount"] = Value::Null, "no number of base units");
+        refuse(&|q| q["details"]["currencyIn"]["currency"]["decimals"] = json!(18), "Relay lists for it");
         refuse(&|q| q["details"]["currencyIn"]["currency"]["chainId"] = json!(10), "not what the payer chose");
         refuse(
             &|q| q["protocol"]["v2"]["orderData"]["output"]["payments"][0]["recipient"] = json!(other),
@@ -995,9 +1489,18 @@ mod tests {
             &|q| q["protocol"]["v2"]["orderData"]["output"]["payments"][0]["minimumAmount"] = json!("1"),
             "the order guarantees 1",
         );
+        refuse(&|q| q["protocol"]["v2"]["orderData"]["output"]["payments"] = json!([]), "pays nothing");
+        refuse(&|q| q["protocol"]["v2"]["orderData"]["output"]["payments"] = Value::Null, "no payments to check");
+        refuse(&|q| q["protocol"]["v2"]["orderData"]["output"]["chainId"] = json!("polygon"), "settles on");
+        refuse(&|q| q["protocol"]["v2"]["orderData"]["inputs"][0]["payment"] = Value::Null, "has no payment");
+        refuse(&|q| q["protocol"]["v2"]["orderData"]["inputs"][0]["refunds"] = Value::Null, "has no refunds");
         refuse(
             &|q| q["protocol"]["v2"]["orderData"]["inputs"][0]["refunds"][0]["recipient"] = json!(other),
             "the order refunds",
+        );
+        refuse(
+            &|q| q["protocol"]["v2"]["orderData"]["inputs"][0]["refunds"][0]["chainId"] = json!("polygon"),
+            "neither the payer's nor this payment's",
         );
         refuse(&|q| q["steps"][1]["items"][0]["data"]["from"] = json!(other), "not the payer");
         refuse(&|q| q["steps"][1]["items"][0]["data"]["chainId"] = json!(8453), "not the origin");
@@ -1022,10 +1525,38 @@ mod tests {
         );
         refuse(&|q| q["steps"][1]["items"][0]["data"]["value"] = json!("1"), "wei of value");
         refuse(&|q| q["protocol"] = json!(null), "no signed order");
-        // A refund to the payment address only counts in the deposit's own token.
+        refuse(&|q| q["protocol"] = json!({ "v2": {} }), "no signed order");
+        // The deposit's own calldata: truncated arguments, someone else's depositor, another token,
+        // an unbounded whole-allowance deposit, an entrypoint the checks don't decode, and a route
+        // that pulls twice.
+        refuse(&|q| q["steps"][1]["items"][0]["data"]["data"] = json!("0xe8017952aa"), "malformed depositErc20");
         refuse(
-            &|q| q["protocol"]["v2"]["orderData"]["inputs"][0]["refunds"][1]["currency"] = json!(USDC_ARB),
-            "neither the payer nor this payment",
+            &|q| q["steps"][1]["items"][0]["data"]["data"] = json!(deposit_erc20(other, USDC_ARB, 2_526_643, REQUEST)),
+            "deposits as",
+        );
+        refuse(
+            &|q| q["steps"][1]["items"][0]["data"]["data"] = json!(deposit_erc20(PAYER, other, 2_526_643, REQUEST)),
+            "not the token being paid with",
+        );
+        refuse(
+            &|q| {
+                q["steps"][1]["items"][0]["data"]["data"] =
+                    json!(format!("0x5a1ee3ac{:0>64}{}", &PAYER[2..], &REQUEST[2..]))
+            },
+            "whole allowance",
+        );
+        refuse(
+            &|q| q["steps"][1]["items"][0]["data"]["data"] = json!(format!("0xdd4ed837{:0>128}", "0")),
+            "the checks don't decode",
+        );
+        refuse(
+            &|q| {
+                q["steps"][0]["items"][0]["data"]["data"] = json!(transfer(DEPOSITORY, 2_526_643));
+                q["steps"][0]["items"][0]["data"]["to"] = json!(USDC_ARB);
+                q["steps"][1]["items"][0]["data"]["data"] = json!(transfer(DEPOSITORY, 2_526_643));
+                q["steps"][1]["items"][0]["data"]["to"] = json!(USDC_ARB);
+            },
+            "take 5053286 from the wallet",
         );
     }
 
@@ -1036,13 +1567,51 @@ mod tests {
         let mut q = relay_quote();
         q["details"]["currencyIn"]["currency"]["address"] = json!(NATIVE);
         q["details"]["currencyIn"]["amount"] = json!("955024944952040");
+        q["protocol"]["v2"]["orderData"]["inputs"][0]["payment"]["currency"] = json!(NATIVE);
+        q["protocol"]["v2"]["orderData"]["inputs"][0]["refunds"][0]["currency"] = json!(NATIVE);
         q["steps"] = json!([q["steps"][1].clone()]);
+        q["steps"][0]["items"][0]["data"]["data"] = json!(deposit_native(PAYER, REQUEST));
         q["steps"][0]["items"][0]["data"]["value"] = json!("955024944952040");
         let quote: Quote = serde_json::from_value(q.clone()).unwrap();
         assert_eq!(check_quote(&quote, &want).unwrap().steps[0].value, "955024944952040");
         q["steps"][0]["items"][0]["data"]["value"] = json!("955024944952041");
         let quote: Quote = serde_json::from_value(q).unwrap();
         assert!(check_quote(&quote, &want).unwrap_err().contains("wei of value"));
+    }
+
+    /// A router route (`multicall` nesting the deposit), canonically encoded by viem from Relay's
+    /// periphery signatures: refund and claim recipients are the payer's, the nested deposit takes
+    /// the quoted input of the quoted token.
+    const MULTICALL_ROUTE: &str = "0xcd6e13f70000000000000000000000000000000000000000000000000000000000000080000000000000000000000000d8da6bf26964af9d7eed9e03e53415d37aa96045000000000000000000000000d8da6bf26964af9d7eed9e03e53415d37aa960450000000000000000000000000000000000000000000000000000000000000200000000000000000000000000000000000000000000000000000000000000000100000000000000000000000000000000000000000000000000000000000000200000000000000000000000004cd00e387622c35bddb9b4c962c136462338bc310000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000800000000000000000000000000000000000000000000000000000000000000084e8017952000000000000000000000000d8da6bf26964af9d7eed9e03e53415d37aa96045000000000000000000000000af88d065e77c8cc2239327c5edb3a432268e58310000000000000000000000000000000000000000000000000000000000268db31790248938255ff5c9db51e367a55380edb458572f010bc52415d45da935ffd5000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000";
+
+    fn router_quote(data: &str, to: &str) -> Value {
+        let mut q = relay_quote();
+        q["steps"] = json!([{ "id": "swap", "kind": "transaction", "description": "Sign to route",
+            "items": [{ "status": "incomplete",
+                        "data": { "from": "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045", "to": to,
+                                  "data": data, "value": "0", "chainId": 42161 } }] }]);
+        q
+    }
+
+    #[test]
+    fn a_router_multicall_route_is_decoded_and_held_to_the_terms() {
+        // The happy route: the wallet calls Relay's depository with a nested depositErc20.
+        let route = check(router_quote(MULTICALL_ROUTE, DEPOSITORY)).unwrap();
+        assert_eq!(route.steps.len(), 1);
+        assert_eq!(route.steps[0].to, DEPOSITORY.to_ascii_lowercase());
+
+        let refuse = |data: &str, to: &str, why: &str| {
+            let err = check(router_quote(data, to)).unwrap_err();
+            assert!(err.contains(why), "{err} (expected {why})");
+        };
+        // Canonical encoding, but the surplus and the claims go to someone else.
+        const BAD_REFUND: &str = "0xcd6e13f700000000000000000000000000000000000000000000000000000000000000800000000000000000000000000000000000000000000000000000000000000bad000000000000000000000000d8da6bf26964af9d7eed9e03e53415d37aa960450000000000000000000000000000000000000000000000000000000000000200000000000000000000000000000000000000000000000000000000000000000100000000000000000000000000000000000000000000000000000000000000200000000000000000000000004cd00e387622c35bddb9b4c962c136462338bc310000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000800000000000000000000000000000000000000000000000000000000000000084e8017952000000000000000000000000d8da6bf26964af9d7eed9e03e53415d37aa96045000000000000000000000000af88d065e77c8cc2239327c5edb3a432268e58310000000000000000000000000000000000000000000000000000000000268db31790248938255ff5c9db51e367a55380edb458572f010bc52415d45da935ffd5000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000";
+        refuse(BAD_REFUND, DEPOSITORY, "not the payer");
+        // A nested transfer of the router's tokens to an address that is not Relay's.
+        const BAD_NESTED: &str = "0xcd6e13f70000000000000000000000000000000000000000000000000000000000000080000000000000000000000000d8da6bf26964af9d7eed9e03e53415d37aa96045000000000000000000000000d8da6bf26964af9d7eed9e03e53415d37aa9604500000000000000000000000000000000000000000000000000000000000001c000000000000000000000000000000000000000000000000000000000000000010000000000000000000000000000000000000000000000000000000000000020000000000000000000000000af88d065e77c8cc2239327c5edb3a432268e58310000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000800000000000000000000000000000000000000000000000000000000000000044a9059cbb0000000000000000000000000000000000000000000000000000000000000bad0000000000000000000000000000000000000000000000000000000000268db3000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000";
+        refuse(BAD_NESTED, DEPOSITORY, "which is not Relay's");
+        // An entrypoint the checks don't decode.
+        refuse("0x2d9fb478", DEPOSITORY, "the checks don't decode");
     }
 
     #[test]
@@ -1066,12 +1635,41 @@ mod tests {
     }
 
     #[test]
-    fn a_missing_minimum_falls_back_to_the_amount() {
+    fn a_missing_minimum_is_refused_not_fallen_back() {
         let mut q = relay_quote();
         q["details"]["currencyOut"].as_object_mut().unwrap().remove("minimumAmount");
-        assert!(check(q.clone()).is_ok());
-        q["details"]["currencyOut"]["amount"] = json!("100");
-        assert!(check(q).is_err());
+        assert!(check(q.clone()).unwrap_err().contains("no number of base units"));
+        // A malformed one is refused just the same, whatever the indicative amount says.
+        q["details"]["currencyOut"]["minimumAmount"] = json!("soon");
+        assert!(check(q).unwrap_err().contains("no number of base units"));
+    }
+
+    #[test]
+    fn the_selectors_are_the_signatures_they_claim() {
+        let sig = |s: &str| {
+            let digest = alloy_primitives::keccak256(s.as_bytes());
+            [digest[0], digest[1], digest[2], digest[3]]
+        };
+        for (selector, signature) in [
+            (DEPOSIT_ERC20, "depositErc20(address,address,uint256,bytes32)"),
+            (DEPOSIT_ERC20_ALL, "depositErc20(address,address,bytes32)"),
+            (DEPOSIT_NATIVE, "depositNative(address,bytes32)"),
+            (MULTICALL, "multicall((address,bool,uint256,bytes)[],address,address,bytes)"),
+            (MULTICALL_V2, "multicall((address,bool,uint256,bytes)[],address,address)"),
+            (
+                TRANSFER_AND_MULTICALL,
+                "transferAndMulticall(address[],uint256[],(address,bool,uint256,bytes)[],address,address,bytes)",
+            ),
+            (
+                TRANSFER_AND_MULTICALL_V2,
+                "transferAndMulticall(address[],uint256[],(address,bool,uint256,bytes)[],address,address)",
+            ),
+            (FORWARD, "forward(bytes)"),
+            (APPROVE, "approve(address,uint256)"),
+            (TRANSFER, "transfer(address,uint256)"),
+        ] {
+            assert_eq!(selector, sig(signature), "{signature}");
+        }
     }
 
     #[test]

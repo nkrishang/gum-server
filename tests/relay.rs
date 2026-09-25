@@ -91,7 +91,8 @@ fn relay_quote(recipient: &str, amount: &str) -> Value {
               "data": { "from": PAYER, "to": USDC_ARB, "value": "0", "chainId": 42161,
                         "data": format!("0x095ea7b3{:0>64}{:064x}", &DEPOSITORY[2..], 2_526_643) } }] },
             { "id": "deposit", "kind": "transaction", "description": "Depositing funds to the relayer", "items": [{ "status": "incomplete",
-              "data": { "from": PAYER, "to": DEPOSITORY, "data": "0xe8017952", "value": "0", "chainId": 42161 },
+              "data": { "from": PAYER, "to": DEPOSITORY, "value": "0", "chainId": 42161,
+                        "data": format!("0xe8017952{:0>64}{:0>64}{:064x}{}", &PAYER[2..], &USDC_ARB[2..], 2_526_643, &REQUEST[2..]) },
               "check": { "endpoint": format!("/intents/status/v3?requestId={REQUEST}"), "method": "GET" } }] }
         ],
         "details": {
@@ -101,8 +102,9 @@ fn relay_quote(recipient: &str, amount: &str) -> Value {
             "totalImpact": { "usd": "-0.0266", "percent": "-1.05" }, "timeEstimate": 2
         },
         "protocol": { "v2": { "orderData": {
-            "inputs": [{ "refunds": [{ "recipient": PAYER, "currency": USDC_ARB }] }],
-            "output": { "payments": [{ "recipient": recipient, "currency": USDC.to_lowercase(), "minimumAmount": amount }] }
+            "inputs": [{ "payment": { "chainId": "arbitrum", "currency": USDC_ARB, "amount": "2526643" },
+                         "refunds": [{ "chainId": "arbitrum", "recipient": PAYER, "currency": USDC_ARB }] }],
+            "output": { "chainId": "anvil", "payments": [{ "recipient": recipient, "currency": USDC.to_lowercase(), "minimumAmount": amount }] }
         } } }
     })
 }
